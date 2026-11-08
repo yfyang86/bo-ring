@@ -91,27 +91,29 @@ pub fn enumerate_hid_mice() -> Vec<HidMouse> {
 }
 
 /// (usage_page, usage, path, product, vid, pid, bus) for every HID interface.
+/// Runs on the shared hidapi worker thread (see `hidpp::with_api`).
 fn hidapi_snapshot() -> Result<Vec<(u16, u16, String, String, u16, u16, &'static str)>, ()> {
-    let api = hidapi::HidApi::new().map_err(|_| ())?;
-    Ok(api
-        .device_list()
-        .map(|d| {
-            let bus = match d.bus_type() {
-                hidapi::BusType::Bluetooth => "bluetooth",
-                hidapi::BusType::Usb => "usb",
-                _ => "other",
-            };
-            (
-                d.usage_page(),
-                d.usage(),
-                d.path().to_string_lossy().to_string(),
-                d.product_string().unwrap_or("Unknown device").to_string(),
-                d.vendor_id(),
-                d.product_id(),
-                bus,
-            )
-        })
-        .collect())
+    hidpp::with_api(true, |api| {
+        api.device_list()
+            .map(|d| {
+                let bus = match d.bus_type() {
+                    hidapi::BusType::Bluetooth => "bluetooth",
+                    hidapi::BusType::Usb => "usb",
+                    _ => "other",
+                };
+                (
+                    d.usage_page(),
+                    d.usage(),
+                    d.path().to_string_lossy().to_string(),
+                    d.product_string().unwrap_or("Unknown device").to_string(),
+                    d.vendor_id(),
+                    d.product_id(),
+                    bus,
+                )
+            })
+            .collect()
+    })
+    .ok_or(())
 }
 
 pub fn enumerate_input_device_names() -> Vec<(PathBuf, String, Option<String>, bool)> {
@@ -167,39 +169,49 @@ pub fn attach_new_mouse_listeners(
     tx: mpsc::Sender<MouseInputEvent>,
     listened_paths: Arc<Mutex<HashSet<PathBuf>>>,
 ) {
+    // Called every couple of seconds by the configurator's auto-scan, so each
+    // listener is attached at most once (markers in `listened_paths`).
+    let claim = |key: &str| listened_paths.lock().map(|mut l| l.insert(PathBuf::from(key))).unwrap_or(false);
     let sock_path = crate::platform::ipc::daemon_socket_path();
-    let tx_ipc = tx.clone();
-    let ctx_ipc = ctx.clone();
+    let daemon_up = std::os::unix::net::UnixStream::connect(&sock_path).is_ok();
 
     // 1. Preferred: events relayed by the running daemon over its Unix socket.
-    let daemon_up = std::os::unix::net::UnixStream::connect(&sock_path).is_ok();
-    thread::spawn(move || {
-        use std::io::{BufRead, BufReader};
-        use std::os::unix::net::UnixStream;
-        use crate::platform::ipc::DaemonIpcEvent;
+    if daemon_up && claim("ipc") {
+        let tx_ipc = tx.clone();
+        let ctx_ipc = ctx.clone();
+        let paths = Arc::clone(&listened_paths);
+        thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            use std::os::unix::net::UnixStream;
+            use crate::platform::ipc::DaemonIpcEvent;
 
-        if let Ok(stream) = UnixStream::connect(&sock_path) {
-            println!("📡 Config UI connected to daemon IPC socket at {:?}", sock_path);
-            let reader = BufReader::new(stream);
-            for line in reader.lines().map_while(Result::ok) {
-                if let Some(event) = DaemonIpcEvent::parse_line(&line) {
-                    let (code_opt, raw_opt, vid_pid, dev_name) = match event {
-                        DaemonIpcEvent::ButtonPressed { raw_code, normalized_code, vid_pid, dev_name } => {
-                            (Some(normalized_code), Some(raw_code), vid_pid, dev_name)
-                        }
-                        DaemonIpcEvent::ButtonCode(code) => (Some(code), Some(code), None, None),
-                        _ => (None, None, None, None),
-                    };
-                    if let (Some(code), Some(raw_code)) = (code_opt, raw_opt) {
-                        if is_supported_button_code(raw_code) || is_supported_button_code(code) {
-                            let _ = tx_ipc.send(MouseInputEvent { code, raw_code, dev_name, vid_pid });
-                            ctx_ipc.request_repaint();
+            if let Ok(stream) = UnixStream::connect(&sock_path) {
+                println!("📡 Config UI connected to daemon IPC socket at {:?}", sock_path);
+                let reader = BufReader::new(stream);
+                for line in reader.lines().map_while(Result::ok) {
+                    if let Some(event) = DaemonIpcEvent::parse_line(&line) {
+                        let (code_opt, raw_opt, vid_pid, dev_name) = match event {
+                            DaemonIpcEvent::ButtonPressed { raw_code, normalized_code, vid_pid, dev_name } => {
+                                (Some(normalized_code), Some(raw_code), vid_pid, dev_name)
+                            }
+                            DaemonIpcEvent::ButtonCode(code) => (Some(code), Some(code), None, None),
+                            _ => (None, None, None, None),
+                        };
+                        if let (Some(code), Some(raw_code)) = (code_opt, raw_opt) {
+                            if is_supported_button_code(raw_code) || is_supported_button_code(code) {
+                                let _ = tx_ipc.send(MouseInputEvent { code, raw_code, dev_name, vid_pid });
+                                ctx_ipc.request_repaint();
+                            }
                         }
                     }
                 }
             }
-        }
-    });
+            // Daemon went away: allow the next scan to reconnect.
+            if let Ok(mut l) = paths.lock() {
+                l.remove(&PathBuf::from("ipc"));
+            }
+        });
+    }
 
     // The daemon already owns the tap and the HID++ diversion: don't compete.
     if daemon_up {
@@ -207,33 +219,33 @@ pub fn attach_new_mouse_listeners(
     }
 
     // 2. Fallback: an observe-only event tap for the standard extra buttons.
-    {
-        let mut lock = listened_paths.lock().unwrap();
-        if lock.insert(PathBuf::from("cgeventtap")) {
-            let (btx, brx) = mpsc::channel::<crate::platform::event_tap::ButtonEvent>();
-            crate::platform::event_tap::start_listen_only_tap(btx);
-            let tx_tap = tx.clone();
-            let ctx_tap = ctx.clone();
+    if claim("cgeventtap") {
+        let (btx, brx) = mpsc::channel::<crate::platform::event_tap::ButtonEvent>();
+        crate::platform::event_tap::start_listen_only_tap(btx);
+        let tx_tap = tx.clone();
+        let ctx_tap = ctx.clone();
+        thread::spawn(move || {
             let name = scan_mouse_device().map(|m| (m.name, m.vid_pid));
-            thread::spawn(move || {
-                for ev in brx {
-                    if ev.value == 1 && is_supported_button_code(ev.code) {
-                        let _ = tx_tap.send(MouseInputEvent {
-                            code: normalize_button_code(ev.code),
-                            raw_code: ev.code,
-                            dev_name: name.as_ref().map(|n| n.0.clone()),
-                            vid_pid: name.as_ref().and_then(|n| n.1.clone()),
-                        });
-                        ctx_tap.request_repaint();
-                    }
+            for ev in brx {
+                if ev.value == 1 && is_supported_button_code(ev.code) {
+                    let _ = tx_tap.send(MouseInputEvent {
+                        code: normalize_button_code(ev.code),
+                        raw_code: ev.code,
+                        dev_name: name.as_ref().map(|n| n.0.clone()),
+                        vid_pid: name.as_ref().and_then(|n| n.1.clone()),
+                    });
+                    ctx_tap.request_repaint();
                 }
-            });
-        }
+            }
+        });
     }
 
-    // 3. Fallback: direct HID++ diversion for Logitech special controls.
-    let diverted_hidpp_paths = Arc::new(Mutex::new(HashSet::new()));
-    hidpp::attach_hidpp_gui_listener(ctx, tx, diverted_hidpp_paths);
+    // 3. Fallback: direct HID++ diversion for Logitech special controls
+    //    (one manager for the process; it handles reconnects itself).
+    if claim("hidpp") {
+        let diverted_hidpp_paths = Arc::new(Mutex::new(HashSet::new()));
+        hidpp::attach_hidpp_gui_listener(ctx, tx, diverted_hidpp_paths);
+    }
 }
 
 pub fn normalize_button_code(code: u16) -> u16 {

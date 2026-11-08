@@ -1,7 +1,25 @@
 //! System accent colour on macOS: `defaults read -g AppleAccentColor`.
 //! Absent key = the default (multicolor/blue); -1 = graphite.
 
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// Cached: the UI asks for this every frame, and spawning `defaults` each time
+/// blocked the main thread. Re-read at most every 10 s to follow user changes.
 pub fn detect_os_accent_color() -> Option<String> {
+    static CACHE: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
+    let mut guard = CACHE.lock().ok()?;
+    if let Some((at, value)) = guard.as_ref() {
+        if at.elapsed() < Duration::from_secs(10) {
+            return value.clone();
+        }
+    }
+    let value = read_accent_color();
+    *guard = Some((Instant::now(), value.clone()));
+    value
+}
+
+fn read_accent_color() -> Option<String> {
     let out = std::process::Command::new("defaults")
         .args(["read", "-g", "AppleAccentColor"])
         .output()
