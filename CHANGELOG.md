@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.0-mac.3] - 2026-11-08
+
+### Fixed
+- **Configurator crash:** the settings window crashed within seconds of opening
+  (`EXC_BREAKPOINT` in `CFRunLoopAddSource`). hidapi ties its device manager to the first
+  thread that uses it, and the 2-second device scan ran on short-lived threads. All hidapi
+  access now runs on one long-lived thread. A regression test reproduces the crash on
+  0.2.0-mac.2.
+- The device scan opened a new connection to the daemon every 2 seconds, which duplicated
+  button events. Listeners are now attached once.
+- The system accent color was read by spawning `defaults` on every UI frame. It's now
+  cached.
+- Opening the app from a mounted DMG no longer installs the daemon LaunchAgent pointing
+  into the DMG.
+
+### Added
+- A **Usage** section in the README: opening the ring, picking slots, trigger modes,
+  per-app rings, remapping, CLI and troubleshooting.
+- Automated releases: merging a version bump to `main` builds the DMG, then tags and
+  publishes the release.
+
+## [0.2.0-mac.2] - 2026-11-08
+
+### Fixed
+- Opening Bo-Ring.app now starts the background daemon (LaunchAgent). Before, the ring
+  never appeared until the service was enabled in Settings.
+- Re-enabling the service while it was running failed with
+  `Bootstrap failed: 5: Input/output error`.
+
+## [0.2.0-mac.1] - 2026-11-08
+
+### Added
+- macOS (Apple Silicon) port: `CGEventTap` button capture, `CGEvent` key and media-key
+  injection, HID++ over IOKit (hidapi), `NSWorkspace` app detection, launchd autostart,
+  Accessibility / Input Monitoring permission helpers, and DMG packaging.
+- MX Master 4 haptic thumb panel (CID `0x01A0`) opens the ring.
+
+---
+
 ## [0.2.0] - 2026-09-11
 
 ### Added

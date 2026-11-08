@@ -1,6 +1,6 @@
 [package]
 name = "bo-ring"
-version = "0.2.0-mac.2"
+version = "0.2.0-mac.3"
 edition = "2024"
 authors = ["BazinFla"]
 repository = "https://github.com/BazinFla/bo-ring"

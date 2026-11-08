@@ -714,7 +714,7 @@ dependencies = [
 
 [[package]]
 name = "bo-ring"
-version = "0.2.0-mac.2"
+version = "0.2.0-mac.3"
 dependencies = [
  "core-foundation",
  "core-graphics",
