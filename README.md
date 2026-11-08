@@ -65,7 +65,7 @@ The app bundle includes the device profiles, images and locales in
 You need Rust 1.85+ (edition 2024) and Xcode command-line tools.
 
 ```bash
-cd boring-mac
+# from the project root (this repository's root, or boring-mac/ in the monorepo)
 ./install.sh                    # builds, installs ~/.local/bin/bo-ring and assets
 ~/.local/bin/bo-ring --daemon   # first run: allow Accessibility + Input Monitoring
 ~/.local/bin/bo-ring            # the configurator (enable the LaunchAgent under Settings)
@@ -73,6 +73,30 @@ cd boring-mac
 
 Permissions attach to the binary that asks for them. If you run it from a terminal,
 macOS attributes them to the terminal app instead.
+
+### Upgrading or reinstalling: remove and re-add the permissions
+
+**Every time you install a new build**, remove Bo-Ring from both privacy lists and add it
+again. Switching the existing entry off and on is **not** enough.
+
+1. Quit the configurator and stop the daemon:
+   `launchctl bootout gui/$(id -u)/dev.bo-ring.daemon`.
+2. Replace `/Applications/Bo-Ring.app` with the new build and open it.
+3. In **System Settings → Privacy & Security → Accessibility**, select **Bo-Ring**, click
+   **–** to remove it, then click **+**, choose `/Applications/Bo-Ring.app`, and turn it
+   on.
+4. Do the same in **Privacy & Security → Input Monitoring**.
+5. Restart the daemon: `launchctl kickstart -k gui/$(id -u)/dev.bo-ring.daemon`
+   (or open Bo-Ring again).
+
+Why: macOS ties each grant to the app's **code signature**, not its name or path. These
+builds are ad-hoc signed, so every build has a new signature. The old entry stays in the
+list, and can still show as *on*, but macOS no longer applies it to the new binary.
+Toggling it only re-enables the stale grant; removing it and adding the app again
+records the new signature. Without this, the daemon logs `Input Monitoring permission
+missing` (the mouse buttons do nothing) and `Could not create the mouse event tap`.
+Builds signed with a stable identity (`BORING_SIGN_IDENTITY`) keep their grants across
+updates.
 
 ## Usage
 

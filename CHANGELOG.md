@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.2.0-mac.4] - 2026-11-08
 
 ### Added
 - **Menu-bar ring switcher:** a daemon menu-bar icon with *Follow Frontmost App*,
@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `bo-ring --ring-mode [auto|default|<profile label or app id>]` to show or switch the
   mode from scripts.
 - `[general] menu_bar_icon = false` hides the icon.
+- README: **Upgrading or reinstalling** section. After installing a new build, remove
+  Bo-Ring from Accessibility and Input Monitoring with **–** and add it back with **+**.
+  Toggling the old entry isn't enough, because macOS ties each grant to the build's code
+  signature.
 
 ### Fixed
 - **Pressing the ring button again didn't close the ring.** Rings spawned by the daemon
