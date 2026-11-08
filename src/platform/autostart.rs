@@ -183,6 +183,16 @@ pub fn ensure_daemon_running_from_bundle() {
     if crate::utils::path::bundle_resources_dir().is_none() || daemon_reachable() {
         return;
     }
+    // Never point the login agent into a mounted DMG or an App Translocation
+    // copy: it disappears on eject/relaunch and launchd would keep failing.
+    let exe = get_exe_path();
+    if !is_installed_location(&exe) {
+        eprintln!(
+            "ℹ️ Not starting the background daemon from {} — move Bo-Ring to /Applications first.",
+            exe.display()
+        );
+        return;
+    }
     if !is_systemd_installed() && opt_out_marker().exists() {
         println!("ℹ️ Background service disabled by the user; not starting the daemon.");
         return;
@@ -192,6 +202,12 @@ pub fn ensure_daemon_running_from_bundle() {
         Ok(()) => println!("✅ Bo-Ring daemon LaunchAgent started from {}", get_exe_path().display()),
         Err(e) => eprintln!("⚠️ Could not start the Bo-Ring daemon: {e}"),
     }
+}
+
+/// True for an app inside /Applications or ~/Applications.
+pub fn is_installed_location(exe: &std::path::Path) -> bool {
+    let user_apps = get_home_dir().join("Applications");
+    exe.starts_with("/Applications") || exe.starts_with(&user_apps)
 }
 
 pub fn restart_systemd_service_if_active() {
@@ -287,6 +303,17 @@ pub fn check_uinput_access() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_installed_location() {
+        use std::path::Path;
+        assert!(is_installed_location(Path::new("/Applications/Bo-Ring.app/Contents/MacOS/bo-ring")));
+        assert!(is_installed_location(&get_home_dir().join("Applications/Bo-Ring.app/Contents/MacOS/bo-ring")));
+        assert!(!is_installed_location(Path::new("/Volumes/Bo-Ring 0.2.0-mac.2/Bo-Ring.app/Contents/MacOS/bo-ring")));
+        assert!(!is_installed_location(Path::new(
+            "/private/var/folders/xx/T/AppTranslocation/ABC/d/Bo-Ring.app/Contents/MacOS/bo-ring"
+        )));
+    }
 
     #[test]
     fn test_agent_plist_contents() {

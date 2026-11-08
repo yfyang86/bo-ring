@@ -109,7 +109,6 @@ pub fn default_ring_color() -> String {
 
 pub fn default_ring_active_color() -> String {
     if let Some(color) = detect_os_accent_color() {
-        println!("🎨 OS accent color detected: {}", color);
         color
     } else {
         "#00D7AF".to_string()

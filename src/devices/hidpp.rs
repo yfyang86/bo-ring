@@ -75,28 +75,68 @@ pub struct LogitechHidDevice {
     pub is_bluetooth: bool,
 }
 
-// hidapi allows a single HidApi instance per process.
-static HIDAPI: Mutex<Option<HidApi>> = Mutex::new(None);
+// ---------------------------------------------------------------------------
+// hidapi worker thread
+//
+// hidapi's macOS backend creates ONE process-wide IOHIDManager and schedules it
+// on the run loop of whichever thread first initializes hidapi
+// (`IOHIDManagerScheduleWithRunLoop(hid_mgr, CFRunLoopGetCurrent())` in hid.c).
+// If that thread exits, its run loop is freed and the next enumeration from
+// any thread crashes in `CFRunLoopAddSource` (__CFCheckCFInfoPACSignature).
+// Concurrent enumerations race on the same manager too. So every HidApi call —
+// init, enumeration, open — runs on this single, never-exiting thread.
+// Opened `HidDevice`s are Send and are read/written from their own threads.
+// ---------------------------------------------------------------------------
 
-fn with_api<T>(f: impl FnOnce(&mut HidApi) -> T) -> Option<T> {
-    let mut guard = HIDAPI.lock().ok()?;
-    if guard.is_none() {
-        match HidApi::new() {
-            Ok(api) => *guard = Some(api),
-            Err(e) => {
-                eprintln!("⚠️ hidapi init failed: {e}");
-                return None;
+type HidJob = Box<dyn FnOnce(Option<&mut HidApi>) + Send>;
+
+fn hid_worker() -> &'static Mutex<mpsc::Sender<HidJob>> {
+    static WORKER: std::sync::OnceLock<Mutex<mpsc::Sender<HidJob>>> = std::sync::OnceLock::new();
+    WORKER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<HidJob>();
+        thread::Builder::new()
+            .name("bo-ring-hidapi".into())
+            .spawn(move || {
+                let mut api = match HidApi::new() {
+                    Ok(api) => Some(api),
+                    Err(e) => {
+                        eprintln!("⚠️ hidapi init failed: {e}");
+                        None
+                    }
+                };
+                // Lives for the whole process, keeping hidapi's run loop valid.
+                for job in rx {
+                    job(api.as_mut());
+                }
+            })
+            .expect("spawn hidapi worker");
+        Mutex::new(tx)
+    })
+}
+
+/// Run `f` on the hidapi worker thread and wait for its result.
+/// `refresh` re-enumerates devices first.
+pub(crate) fn with_api<T: Send + 'static>(
+    refresh: bool,
+    f: impl FnOnce(&mut HidApi) -> T + Send + 'static,
+) -> Option<T> {
+    let (rtx, rrx) = mpsc::sync_channel::<Option<T>>(1);
+    let job: HidJob = Box::new(move |api| {
+        let out = api.map(|api| {
+            if refresh {
+                let _ = api.refresh_devices();
             }
-        }
-    } else if let Some(api) = guard.as_mut() {
-        let _ = api.refresh_devices();
-    }
-    guard.as_mut().map(f)
+            f(api)
+        });
+        let _ = rtx.send(out);
+    });
+    hid_worker().lock().ok()?.send(job).ok()?;
+    rrx.recv().ok().flatten()
 }
 
 fn open_path(path: &PathBuf) -> Option<HidDevice> {
     let c = CString::new(path.to_string_lossy().as_bytes()).ok()?;
-    with_api(|api| api.open_path(&c).ok()).flatten()
+    with_api(false, move |api| api.open_path(&c).ok()).flatten()
 }
 
 /// Build a long HID++ request with software id `sw_id`.
@@ -199,7 +239,7 @@ pub fn battery_status(dev: &HidDevice, dev_idx: u8) -> Option<(u8, bool)> {
 
 /// Candidate HID++ interfaces: (path, product name, vid:pid, is_bluetooth, is_receiver).
 fn hidpp_interfaces() -> Vec<(PathBuf, String, String, bool, bool)> {
-    with_api(|api| {
+    with_api(true, |api| {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for d in api.device_list() {
@@ -499,6 +539,20 @@ mod tests {
         assert_eq!(cid_to_button_code(0x0056), BTN_FORWARD_CODE);
         assert_eq!(cid_to_button_code(0x0052), BTN_MIDDLE_CODE);
         assert_eq!(cid_to_button_code(0x1234), 0x1234);
+    }
+
+    /// Regression: hidapi was first initialized on a short-lived thread, whose
+    /// run loop then died; later enumerations crashed in CFRunLoopAddSource.
+    #[test]
+    fn test_hidapi_from_short_lived_threads() {
+        thread::spawn(|| with_api(true, |api| api.device_list().count())).join().unwrap();
+        let handles: Vec<_> = (0..8)
+            .map(|_| thread::spawn(|| (0..5).filter_map(|_| crate::devices::scan_mouse_device()).count()))
+            .collect();
+        for h in handles {
+            h.join().expect("enumeration thread panicked");
+        }
+        assert!(with_api(true, |api| api.device_list().count()).is_some());
     }
 
     #[test]
