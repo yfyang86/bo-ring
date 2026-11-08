@@ -34,6 +34,12 @@ struct InputEvent {
 }
 
 fn main() {
+    // The daemon blocks SIGTERM/SIGINT/SIGHUP for its shutdown thread, and a
+    // blocked-signal mask is inherited across fork/exec. Without this, a ring
+    // spawned by the daemon ignored the SIGTERM that is meant to close it, so
+    // pressing the ring button again stacked a second ring on top.
+    unblock_termination_signals();
+
     let args: Vec<String> = env::args().collect();
 
     if args.iter().any(|arg| arg == "--uninstall") {
@@ -47,7 +53,44 @@ fn main() {
         let initial_app = args.windows(2).find(|w| w[0] == "--app").map(|w| w[1].clone());
         let config = Config::load_or_default();
         let lang = crate::utils::i18n::resolve_language_code(&config.general.language);
-        run_ring_menu_window(config.ring_menu, config.app_profiles, initial_app, lang);
+        // Menu-bar switcher / `--ring-mode`: follow the app, force the default
+        // ring, or pin one profile.
+        let mode = config::ring_mode::load();
+        let mode_desc = config::ring_mode::describe(&mode, &config.app_profiles);
+        let (profiles, initial_app) = config::ring_mode::apply(&mode, config.app_profiles, initial_app);
+        let chosen = initial_app
+            .as_deref()
+            .and_then(|app| profiles.iter().find(|p| config::matches_app_id(&p.app_id, app)))
+            .map(|p| p.label.clone())
+            .unwrap_or_else(|| "default ring".to_string());
+        println!("🎯 Ring mode: {mode_desc} → showing {chosen}");
+        run_ring_menu_window(config.ring_menu, profiles, initial_app, lang);
+        return;
+    }
+
+    // `bo-ring --ring-mode [auto|default|<profile label or app id>]`
+    if let Some(i) = args.iter().position(|a| a == "--ring-mode") {
+        let config = Config::load_or_default();
+        match args.get(i + 1) {
+            None => println!("{}", config::ring_mode::describe(&config::ring_mode::load(), &config.app_profiles)),
+            Some(name) => match config::ring_mode::resolve_name(name, &config.app_profiles) {
+                Some(mode) => {
+                    if let Err(e) = config::ring_mode::save(&mode) {
+                        eprintln!("❌ Could not save ring mode: {e}");
+                        std::process::exit(1);
+                    }
+                    println!("Ring mode: {}", config::ring_mode::describe(&mode, &config.app_profiles));
+                }
+                None => {
+                    eprintln!("❌ Unknown ring '{name}'. Use auto, default, or one of:");
+                    for p in &config.app_profiles {
+                        let first = p.app_id.split(';').next().unwrap_or("").trim();
+                        eprintln!("   \"{}\"  (or an app id such as {first})", p.label);
+                    }
+                    std::process::exit(2);
+                }
+            },
+        }
         return;
     }
 
@@ -140,38 +183,72 @@ fn run_daemon() {
     println!("========================================================\n");
 
     let ipc_clients = start_ipc_server(Arc::clone(&button_mappings));
+    let menu_bar = config.general.menu_bar_icon;
 
-    while let Ok(ev) = rx.recv() {
-        let raw_code = ev.code;
-        let code = normalize_button_code(raw_code);
-        let is_primary_click = raw_code == BTN_LEFT_CODE || raw_code == BTN_RIGHT_CODE;
-        let mappings_guard = button_mappings.read().unwrap();
-        let is_remapped = !is_primary_click && (mappings_guard.contains_key(&raw_code) || mappings_guard.contains_key(&code));
-
-        if is_supported_button_code(raw_code) {
-            broadcast_button_event(&ipc_clients, raw_code, code, ev.value, ev.vid_pid.as_deref(), Some(&ev.dev_name));
+    let event_loop = move || {
+        while let Ok(ev) = rx.recv() {
+            handle_input_event(ev, &button_mappings, &ipc_clients);
         }
+    };
+    if menu_bar {
+        // AppKit (the menu-bar icon) must own the main thread.
+        thread::Builder::new().name("bo-ring-events".into()).spawn(event_loop).expect("spawn event loop");
+        platform::menubar::run();
+    } else {
+        event_loop();
+    }
+}
 
-        if !is_remapped {
-            // Not remapped: the event tap already let the click through.
-            continue;
-        }
-        let action = mappings_guard.get(&raw_code).or_else(|| mappings_guard.get(&code)).cloned();
-        drop(mappings_guard);
+fn handle_input_event(
+    ev: InputEvent,
+    button_mappings: &Arc<std::sync::RwLock<std::collections::HashMap<u16, ButtonActionConfig>>>,
+    ipc_clients: &IpcClients,
+) {
+    let raw_code = ev.code;
+    let code = normalize_button_code(raw_code);
+    let is_primary_click = raw_code == BTN_LEFT_CODE || raw_code == BTN_RIGHT_CODE;
+    let mappings_guard = button_mappings.read().unwrap();
+    let is_remapped = !is_primary_click && (mappings_guard.contains_key(&raw_code) || mappings_guard.contains_key(&code));
 
-        if matches!(action, Some(ButtonActionConfig::ShowRingMenu)) {
-            RING_BUTTON_HELD.store(ev.value == 1, Ordering::SeqCst);
-        }
-        if ev.value == 1 {
-            if let Some(action) = action {
-                println!("🔘 Button pressed (Raw {} -> Normalized {}) -> {:?}", raw_code, code, action);
-                match action {
-                    ButtonActionConfig::ShowRingMenu => toggle_ring_menu(),
-                    _ => execute_action_direct(&action),
-                }
+    if is_supported_button_code(raw_code) {
+        broadcast_button_event(ipc_clients, raw_code, code, ev.value, ev.vid_pid.as_deref(), Some(&ev.dev_name));
+    }
+
+    if !is_remapped {
+        // Not remapped: the event tap already let the click through.
+        return;
+    }
+    let action = mappings_guard.get(&raw_code).or_else(|| mappings_guard.get(&code)).cloned();
+    drop(mappings_guard);
+
+    if matches!(action, Some(ButtonActionConfig::ShowRingMenu)) {
+        RING_BUTTON_HELD.store(ev.value == 1, Ordering::SeqCst);
+    }
+    if ev.value == 1 {
+        if let Some(action) = action {
+            println!("🔘 Button pressed (Raw {} -> Normalized {}) -> {:?}", raw_code, code, action);
+            match action {
+                ButtonActionConfig::ShowRingMenu => toggle_ring_menu(),
+                _ => execute_action_direct(&action),
             }
         }
     }
+}
+
+fn termination_sigset() -> libc::sigset_t {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::sigaddset(&mut set, sig);
+        }
+        set
+    }
+}
+
+fn unblock_termination_signals() {
+    let set = termination_sigset();
+    unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
 }
 
 /// SIGTERM / SIGINT / SIGHUP: restore diverted Logitech controls, remove the

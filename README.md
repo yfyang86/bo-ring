@@ -65,7 +65,7 @@ The app bundle includes the device profiles, images and locales in
 You need Rust 1.85+ (edition 2024) and Xcode command-line tools.
 
 ```bash
-cd boring-mac
+# from the project root (this repository's root, or boring-mac/ in the monorepo)
 ./install.sh                    # builds, installs ~/.local/bin/bo-ring and assets
 ~/.local/bin/bo-ring --daemon   # first run: allow Accessibility + Input Monitoring
 ~/.local/bin/bo-ring            # the configurator (enable the LaunchAgent under Settings)
@@ -73,6 +73,30 @@ cd boring-mac
 
 Permissions attach to the binary that asks for them. If you run it from a terminal,
 macOS attributes them to the terminal app instead.
+
+### Upgrading or reinstalling: remove and re-add the permissions
+
+**Every time you install a new build**, remove Bo-Ring from both privacy lists and add it
+again. Switching the existing entry off and on is **not** enough.
+
+1. Quit the configurator and stop the daemon:
+   `launchctl bootout gui/$(id -u)/dev.bo-ring.daemon`.
+2. Replace `/Applications/Bo-Ring.app` with the new build and open it.
+3. In **System Settings → Privacy & Security → Accessibility**, select **Bo-Ring**, click
+   **–** to remove it, then click **+**, choose `/Applications/Bo-Ring.app`, and turn it
+   on.
+4. Do the same in **Privacy & Security → Input Monitoring**.
+5. Restart the daemon: `launchctl kickstart -k gui/$(id -u)/dev.bo-ring.daemon`
+   (or open Bo-Ring again).
+
+Why: macOS ties each grant to the app's **code signature**, not its name or path. These
+builds are ad-hoc signed, so every build has a new signature. The old entry stays in the
+list, and can still show as *on*, but macOS no longer applies it to the new binary.
+Toggling it only re-enables the stale grant; removing it and adding the app again
+records the new signature. Without this, the daemon logs `Input Monitoring permission
+missing` (the mouse buttons do nothing) and `Could not create the mouse event tap`.
+Builds signed with a stable identity (`BORING_SIGN_IDENTITY`) keep their grants across
+updates.
 
 ## Usage
 
@@ -110,6 +134,29 @@ default ring. Apps are matched by **bundle id** (e.g. `com.apple.Safari`). Add a
 with the **Ring** tab → app profiles, and put its bundle id in *App ID*. To find a bundle
 id, run `osascript -e 'id of app "Notes"'`.
 
+### Switch rings from the menu bar
+The daemon puts a ring icon in the menu bar. Its **Ring to show** menu sets which ring
+opens:
+* **Follow Frontmost App** (default): the per-app ring for the active app, if one matches.
+  The icon is a hollow ring.
+* **Always Default Ring**: ignore the per-app rings. The icon is filled and labelled
+  *Default*.
+* **Always: <profile>**: pin one ring, e.g. *Web Browsers*, wherever you are. The icon
+  shows the profile's name.
+
+The menu also has **Open Ring**, **Settings…** and **Show Log**. The choice applies from
+the next ring you open and is stored in `~/.config/bo-ring/ring-mode`, so saving in the
+configurator never resets it. To script it:
+
+```bash
+bo-ring --ring-mode               # show the current mode
+bo-ring --ring-mode default       # always the default ring
+bo-ring --ring-mode "web browsers"   # pin a profile, by label or app id ("vscode", "com.apple.Safari")
+bo-ring --ring-mode auto          # follow the frontmost app again
+```
+
+To hide the icon, set `menu_bar_icon = false` under `[general]` in `config.toml`.
+
 ### Remap mouse buttons
 In the **Buttons** tab, click a button on the mouse picture, or press the physical button to
 capture it, then choose an action:
@@ -141,6 +188,7 @@ $B                  # configurator (also starts the daemon if it isn't running)
 $B --daemon         # run the daemon in the foreground (logs to the terminal)
 $B --toggle         # open / close the ring through the running daemon
 $B --ring           # show the ring overlay on its own (no daemon needed)
+$B --ring-mode default   # which ring to show: auto | default | <profile>
 $B --install-agent  # install + start the daemon LaunchAgent
 $B --uninstall      # remove LaunchAgents, config and logs (asks first)
 ```
@@ -148,7 +196,10 @@ $B --uninstall      # remove LaunchAgents, config and logs (asks first)
 ### Files
 | Path | Contents |
 |---|---|
-| `~/.config/bo-ring/config.toml`, `rings/*.ring.toml` | configuration (same format as Linux) |
+| `~/.config/bo-ring/rings/default.ring.toml` | **the main ring**: slots, submenus, actions. Edit this file by hand, not `config.toml` |
+| `~/.config/bo-ring/rings/<app>.ring.toml` | per-app rings |
+| `~/.config/bo-ring/ring-mode` | menu-bar ring choice: `auto`, `default` or `app:<app_id>` |
+| `~/.config/bo-ring/config.toml` | general settings and **button mappings**. Its ring sections are a copy written on Save; nothing reads them back |
 | `~/Library/LaunchAgents/dev.bo-ring.daemon.plist` | daemon autostart |
 | `~/Library/Logs/bo-ring/daemon.log` | daemon log (button presses, HID++ diversion, permission warnings) |
 
@@ -161,6 +212,10 @@ $B --uninstall      # remove LaunchAgents, config and logs (asks first)
   new signature, so macOS ignores permissions granted to an earlier build even when the
   switch still shows on.
 * **The ring opens, but shortcuts don't reach the app.** That needs **Accessibility**.
+* **A slot runs the wrong action, or an edit has no effect.** Edit
+  `rings/default.ring.toml`, not `config.toml`. Close the configurator first, or its next
+  Save writes its in-memory copy back. Only `*.toml` files in `rings/` are loaded, so keep
+  backups elsewhere.
 * **The side buttons aren't remapped.** The event tap needs **Accessibility**. A log that
   repeats `Could not create the mouse event tap` means it's missing.
 

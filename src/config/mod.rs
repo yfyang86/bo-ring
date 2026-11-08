@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod presets;
 pub mod rings;
+pub mod ring_mode;
 
 pub use actions::*;
 pub use presets::*;
@@ -95,6 +96,13 @@ pub struct GeneralConfig {
     pub mode_editor: bool,
     #[serde(default = "default_device_profile")]
     pub device_profile: String,
+    /// macOS: show the daemon's menu-bar icon (ring switcher, open ring, settings).
+    #[serde(default = "default_true")]
+    pub menu_bar_icon: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_device_name() -> String {
@@ -277,7 +285,10 @@ impl Config {
                 let mut loaded_profiles = Vec::new();
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_file() {
+                    // Only real ring files: a stray backup such as
+                    // `default.ring.toml.bak` would otherwise parse as a profile
+                    // and could silently replace the main ring.
+                    if path.is_file() && is_ring_file(&path) {
                         if let Ok(content) = fs::read_to_string(&path) {
                             if let Ok(profile) = toml::from_str::<AppProfileConfig>(&content) {
                                 if profile.app_id == "default" || path.file_name().and_then(|n| n.to_str()) == Some("default.ring.toml") {
@@ -355,6 +366,11 @@ impl Config {
         }
         cfg
     }
+}
+
+/// Files in `rings/` that are loaded as ring profiles.
+pub fn is_ring_file(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|e| e == "toml")
 }
 
 #[cfg(test)]
@@ -467,6 +483,15 @@ mod tests {
         assert!(toml_str.contains("fr = \"Lecture / Pause\""));
         let reloaded: NamedActionConfig = toml::from_str(&toml_str).expect("Action deserialization failed");
         assert_eq!(reloaded.label_lang("fr"), "Lecture / Pause");
+    }
+
+    #[test]
+    fn test_only_toml_files_are_rings() {
+        use std::path::Path;
+        assert!(is_ring_file(Path::new("/x/rings/default.ring.toml")));
+        assert!(!is_ring_file(Path::new("/x/rings/default.ring.toml.bak-151513")));
+        assert!(!is_ring_file(Path::new("/x/rings/default.ring.toml~")));
+        assert!(!is_ring_file(Path::new("/x/rings/.DS_Store")));
     }
 
     #[test]
