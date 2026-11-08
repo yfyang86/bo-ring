@@ -52,8 +52,10 @@ scripts/build-dmg.sh --universal  # arm64 + x86_64 (rustup target add x86_64-app
 ```
 
 Open the DMG, drag **Bo-Ring** to Applications, and launch it. The first launch of an
-ad-hoc signed build needs right-click → Open. Then go to Settings → Background Service
-and enable the LaunchAgent, and allow Accessibility and Input Monitoring for Bo-Ring.
+ad-hoc signed build needs right-click → Open. Opening the app starts the background
+daemon automatically (as a LaunchAgent, so it also runs at login). You can turn it off
+under Settings → Background Service, and that choice is remembered. Allow Accessibility
+and Input Monitoring for Bo-Ring when macOS asks.
 Set `BORING_SIGN_IDENTITY="Developer ID Application: …"` to sign with a real identity.
 The app bundle includes the device profiles, images and locales in
 `Contents/Resources`, and its icon is rendered by `packaging/macos/make-icon.swift`.
