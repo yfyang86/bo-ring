@@ -1,15 +1,21 @@
-//! Native Logitech HID++ 2.0 implementation for button diversion and capture.
+//! Native Logitech HID++ 2.0 button diversion on macOS (IOKit via hidapi).
 //!
-//! Enables Bo-Ring to autonomously divert Logitech special buttons (such as the
-//! thumb rest gesture button on MX Master 2S, 3, 4) directly via `/dev/hidraw*`
-//! without requiring third-party tools like Solaar or logiops.
+//! Port of the Linux `/dev/hidraw*` engine. Differences on macOS:
+//! * devices are found through hidapi's IOKit backend by vendor (046d) and the
+//!   HID++ vendor collection (usage page 0xFF43 over Bluetooth LE, 0xFF00
+//!   usage 0x0002 on Bolt/Unifying receivers);
+//! * Bluetooth LE only carries **long** reports (0x11), device index 0xFF;
+//! * devices are opened in *shared* mode (never seize the mouse);
+//! * diverted controls are **restored on shutdown** (`undivert_all`), so a
+//!   stopped daemon never leaves a dead button behind.
+//!
+//! Needs the Input Monitoring permission.
 
-use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
+use hidapi::{HidApi, HidDevice};
+use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
+use std::path::PathBuf;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,10 +23,29 @@ use crate::devices::codes::*;
 
 pub const REPORT_ID_SHORT: u8 = 0x10;
 pub const REPORT_ID_LONG: u8 = 0x11;
-
 pub const DEV_INDEX_WIRELESS_OR_BT: u8 = 0xFF;
+/// Software IDs rotate per request (0x2..=0xF). On macOS every open handle to a
+/// HID device receives *every* input report, so concurrent requesters (e.g. a
+/// battery poll while discovery runs) would otherwise steal each other's ROOT
+/// replies, which do not echo the queried feature id. 0x0 is reserved for
+/// notifications; 0x1 is left for other tools.
+static NEXT_SW_ID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0x2);
+
+fn next_sw_id() -> u8 {
+    use std::sync::atomic::Ordering;
+    let mut cur = NEXT_SW_ID.load(Ordering::Relaxed);
+    loop {
+        let next = if cur >= 0xF { 0x2 } else { cur + 1 };
+        match NEXT_SW_ID.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return cur,
+            Err(actual) => cur = actual,
+        }
+    }
+}
 
 pub const FEATURE_ROOT: u16 = 0x0000;
+pub const FEATURE_UNIFIED_BATTERY: u16 = 0x1004;
+pub const FEATURE_BATTERY_STATUS: u16 = 0x1000;
 pub const FEATURE_REPROG_CONTROLS_V4: u16 = 0x1B04;
 pub const FEATURE_REPROG_CONTROLS: u16 = 0x1B00;
 
@@ -30,12 +55,15 @@ pub const CID_SMARTSHIFT_BUTTON: u16 = 0x00C4; // Mode-shift / top button behind
 pub const CID_APP_SWITCH_BUTTON: u16 = 0x00D0; // Hidden thumb gesture button (M720 Triathlon, M590)
 pub const CID_DPI_SWITCH_BUTTON: u16 = 0x00FD; // Top DPI switch button (MX Vertical, Lift)
 pub const CID_PRECISION_BUTTON: u16 = 0x00ED; // Trackball precision mode button (MX Ergo)
+pub const CID_HAPTIC_PANEL: u16 = 0x01A0; // MX Master 4 haptic "Actions Ring" thumb panel
 
-/// Diversion flags for setCidReporting
-/// Bit 0: DIVERTED, Bit 1: DIVERTED_VALID mask -> 0x03
+/// setCidReporting flags (HID++ 0x1B04): bit0 divert, bit1 divert-valid.
+/// Verified on an MX Master 4 over BLE by reading back with getCidReporting.
 pub const FLAG_DIVERT_ON: u8 = 0x03;
-/// Bit 0: 0, Bit 1: DIVERTED_VALID mask -> 0x02
 pub const FLAG_DIVERT_OFF: u8 = 0x02;
+
+const USAGE_PAGE_HIDPP_BLE: u16 = 0xFF43;
+const USAGE_PAGE_HIDPP_RECEIVER: u16 = 0xFF00;
 
 #[derive(Clone, Debug)]
 pub struct LogitechHidDevice {
@@ -44,535 +72,415 @@ pub struct LogitechHidDevice {
     pub vid_pid: Option<String>,
     pub dev_index: u8,
     pub reprog_feature_index: u8,
+    pub is_bluetooth: bool,
 }
 
-/// Drains unread incoming bytes in the non-blocking hidraw buffer.
-pub fn flush_hidraw(file: &mut File) {
-    let mut buf = [0u8; 64];
-    while file.read(&mut buf).is_ok() {}
-}
+// hidapi allows a single HidApi instance per process.
+static HIDAPI: Mutex<Option<HidApi>> = Mutex::new(None);
 
-/// Discovers connected Logitech mice that support reprogrammable controls (0x1B04 or 0x1B00),
-/// skipping any device paths that are already actively monitored.
-pub fn discover_logitech_mice(ignored_paths: &HashSet<PathBuf>) -> Vec<LogitechHidDevice> {
-    let mut devices = Vec::new();
-
-    let entries = match std::fs::read_dir("/dev") {
-        Ok(e) => e,
-        Err(_) => return devices,
-    };
-
-    for entry in entries.flatten() {
-        let file_name = entry.file_name().to_string_lossy().to_string();
-        if !file_name.starts_with("hidraw") {
-            continue;
-        }
-
-        let dev_path = entry.path();
-        if ignored_paths.contains(&dev_path) {
-            continue;
-        }
-
-        let uevent_path = PathBuf::from("/sys/class/hidraw")
-            .join(&file_name)
-            .join("device/uevent");
-
-        let uevent = match std::fs::read_to_string(&uevent_path) {
-            Ok(content) => content,
-            Err(_) => continue,
-        };
-
-        let uevent_low = uevent.to_lowercase();
-        // Check Logitech vendor ID 046d and exclude keyboards
-        if !uevent_low.contains("v0000046d") || uevent_low.contains("keyboard") {
-            continue;
-        }
-
-        // Extract device name from uevent HID_NAME
-        let name = uevent
-            .lines()
-            .find(|line| line.starts_with("HID_NAME="))
-            .map(|line| line.trim_start_matches("HID_NAME=").to_string())
-            .unwrap_or_else(|| "Logitech Device".to_string());
-
-        // Extract VID:PID
-        let vid_pid = uevent.lines().find(|line| line.starts_with("HID_ID=")).and_then(|line| {
-            let parts: Vec<&str> = line.trim_start_matches("HID_ID=").split(':').collect();
-            if parts.len() >= 3 {
-                let v = parts[1].trim_start_matches("0000").to_lowercase();
-                let p = parts[2].trim_start_matches("0000").to_lowercase();
-                Some(format!("{:0>4}:{:0>4}", v, p))
-            } else {
-                None
+fn with_api<T>(f: impl FnOnce(&mut HidApi) -> T) -> Option<T> {
+    let mut guard = HIDAPI.lock().ok()?;
+    if guard.is_none() {
+        match HidApi::new() {
+            Ok(api) => *guard = Some(api),
+            Err(e) => {
+                eprintln!("⚠️ hidapi init failed: {e}");
+                return None;
             }
-        });
+        }
+    } else if let Some(api) = guard.as_mut() {
+        let _ = api.refresh_devices();
+    }
+    guard.as_mut().map(f)
+}
 
-        // Determine candidate device indices to probe:
-        // Direct Bluetooth or wired devices use 0xFF.
-        // USB Receivers can have paired devices at slots 1..=6 as well as 0xFF.
-        let is_receiver = name.to_lowercase().contains("receiver");
-        let candidate_indices: Vec<u8> = if is_receiver {
-            vec![1, 2, 3, 4, 0xFF]
-        } else {
-            vec![0xFF, 1]
-        };
+fn open_path(path: &PathBuf) -> Option<HidDevice> {
+    let c = CString::new(path.to_string_lossy().as_bytes()).ok()?;
+    with_api(|api| api.open_path(&c).ok()).flatten()
+}
 
-        for dev_idx in candidate_indices {
-            if let Ok(mut file) = open_hidraw(&dev_path) {
-                flush_hidraw(&mut file);
-                // Try to find REPROG_CONTROLS_V4 (0x1B04), then fallback to 0x1B00
-                let feature_idx = query_feature_index(&mut file, dev_idx, FEATURE_REPROG_CONTROLS_V4)
-                    .or_else(|| query_feature_index(&mut file, dev_idx, FEATURE_REPROG_CONTROLS));
+/// Build a long HID++ request with software id `sw_id`.
+pub fn long_request_sw(dev_idx: u8, feature_idx: u8, function: u8, params: &[u8], sw_id: u8) -> [u8; 20] {
+    let mut req = [0u8; 20];
+    req[0] = REPORT_ID_LONG;
+    req[1] = dev_idx;
+    req[2] = feature_idx;
+    req[3] = ((function & 0x0F) << 4) | (sw_id & 0x0F);
+    for (i, b) in params.iter().take(16).enumerate() {
+        req[4 + i] = *b;
+    }
+    req
+}
 
-                if let Some(feat_idx) = feature_idx {
-                    if feat_idx > 0 {
-                        devices.push(LogitechHidDevice {
-                            path: dev_path.clone(),
-                            name: name.clone(),
-                            vid_pid: vid_pid.clone(),
-                            dev_index: dev_idx,
-                            reprog_feature_index: feat_idx,
-                        });
-                        break;
+/// Build a long HID++ request (software id 0xE, for fire-and-forget writes).
+pub fn long_request(dev_idx: u8, feature_idx: u8, function: u8, params: &[u8]) -> [u8; 20] {
+    long_request_sw(dev_idx, feature_idx, function, params, 0x0E)
+}
+
+/// Drain any queued input reports.
+pub fn flush(dev: &HidDevice) {
+    let mut buf = [0u8; 64];
+    while let Ok(n) = dev.read_timeout(&mut buf, 0) {
+        if n == 0 {
+            break;
+        }
+    }
+}
+
+/// Synchronous request/response (matching device, feature and function/sw-id).
+pub fn call(dev: &HidDevice, dev_idx: u8, feature_idx: u8, function: u8, params: &[u8], timeout_ms: u64) -> Option<[u8; 20]> {
+    let req = long_request_sw(dev_idx, feature_idx, function, params, next_sw_id());
+    dev.write(&req).ok()?;
+    let start = Instant::now();
+    let mut resp = [0u8; 64];
+    while start.elapsed() < Duration::from_millis(timeout_ms) {
+        let left = timeout_ms.saturating_sub(start.elapsed().as_millis() as u64).max(1) as i32;
+        match dev.read_timeout(&mut resp, left) {
+            Ok(n) if n >= 4 => {
+                if (resp[0] == REPORT_ID_LONG || resp[0] == REPORT_ID_SHORT) && resp[1] == dev_idx {
+                    // HID++ 2.0 error: [id, dev, 0xFF, feat, func, code]
+                    if resp[2] == 0xFF && resp[3] == feature_idx && resp[4] == req[3] {
+                        return None;
+                    }
+                    if resp[2] == feature_idx && resp[3] == req[3] {
+                        let mut out = [0u8; 20];
+                        out[..n.min(20)].copy_from_slice(&resp[..n.min(20)]);
+                        return Some(out);
                     }
                 }
             }
-        }
-    }
-
-    devices
-}
-
-/// Opens a `/dev/hidraw*` device with non-blocking flags.
-pub fn open_hidraw(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-}
-
-/// Queries feature index from the device's IRoot feature (0x0000) using GetFeature (func 0x00).
-pub fn query_feature_index(file: &mut File, dev_idx: u8, feature_id: u16) -> Option<u8> {
-    flush_hidraw(file);
-
-    let mut req = [0u8; 20];
-    req[0] = REPORT_ID_LONG;
-    req[1] = dev_idx;
-    req[2] = 0x00; // Root feature index
-    req[3] = 0x00; // Function 0: GetFeature
-    req[4] = (feature_id >> 8) as u8;
-    req[5] = (feature_id & 0xFF) as u8;
-
-    if file.write_all(&req).is_err() {
-        return None;
-    }
-
-    let start = Instant::now();
-    let mut resp = [0u8; 32];
-    while start.elapsed() < Duration::from_millis(250) {
-        match file.read(&mut resp) {
-            Ok(n) if n >= 5 => {
-                if resp[0] == REPORT_ID_LONG && resp[1] == dev_idx && resp[2] == 0x00 && resp[3] == 0x00 {
-                    let feat_idx = resp[4];
-                    return if feat_idx > 0 { Some(feat_idx) } else { None };
-                }
-            }
             Ok(_) => {}
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(_) => break,
+            Err(_) => return None,
         }
     }
-
     None
 }
 
-/// Verifies whether a specific Control ID (CID) currently has the DIVERTED flag set.
-pub fn is_cid_diverted(
-    file: &mut File,
-    dev_idx: u8,
-    reprog_feature_index: u8,
-    cid: u16,
-) -> bool {
-    flush_hidraw(file);
-
-    let mut req = [0u8; 20];
-    req[0] = REPORT_ID_LONG;
-    req[1] = dev_idx;
-    req[2] = reprog_feature_index;
-    req[3] = 0x20; // Function 2: getCidReporting
-    req[4] = (cid >> 8) as u8;
-    req[5] = (cid & 0xFF) as u8;
-
-    if file.write_all(&req).is_err() {
-        return false;
-    }
-
-    let start = Instant::now();
-    let mut resp = [0u8; 32];
-    while start.elapsed() < Duration::from_millis(250) {
-        match file.read(&mut resp) {
-            Ok(n) if n >= 7 => {
-                if resp[0] == REPORT_ID_LONG && resp[1] == dev_idx && resp[2] == reprog_feature_index && resp[3] == 0x20 {
-                    let flags = resp[6];
-                    return (flags & 0x01) != 0;
-                }
-            }
-            Ok(_) => {}
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(_) => break,
-        }
-    }
-
-    false
+/// ROOT.getFeature → runtime feature index.
+pub fn query_feature_index(dev: &HidDevice, dev_idx: u8, feature_id: u16) -> Option<u8> {
+    let r = call(dev, dev_idx, 0x00, 0x0, &[(feature_id >> 8) as u8, (feature_id & 0xFF) as u8], 300)?;
+    (r[4] != 0).then_some(r[4])
 }
 
-/// Diverts or un-diverts a specific Control ID (CID) using setCidReporting (func 0x30).
-pub fn set_cid_diverted(
-    file: &mut File,
-    dev_idx: u8,
-    reprog_feature_index: u8,
-    cid: u16,
-    divert: bool,
-) -> bool {
-    flush_hidraw(file);
+pub fn is_cid_diverted(dev: &HidDevice, dev_idx: u8, reprog_feature_index: u8, cid: u16) -> bool {
+    call(dev, dev_idx, reprog_feature_index, 0x2, &[(cid >> 8) as u8, (cid & 0xFF) as u8], 300)
+        .map(|r| r[6] & 0x01 != 0)
+        .unwrap_or(false)
+}
 
-    let mut req = [0u8; 20];
-    req[0] = REPORT_ID_LONG;
-    req[1] = dev_idx;
-    req[2] = reprog_feature_index;
-    req[3] = 0x30; // Function 3: setCidReporting
-    req[4] = (cid >> 8) as u8;
-    req[5] = (cid & 0xFF) as u8;
-    req[6] = if divert { FLAG_DIVERT_ON } else { FLAG_DIVERT_OFF };
-    req[7] = 0x00; // remap high byte
-    req[8] = 0x00; // remap low byte
-
-    if file.write_all(&req).is_err() {
-        return false;
+pub fn set_cid_diverted(dev: &HidDevice, dev_idx: u8, reprog_feature_index: u8, cid: u16, divert: bool) -> bool {
+    let flags = if divert { FLAG_DIVERT_ON } else { FLAG_DIVERT_OFF };
+    let params = [(cid >> 8) as u8, (cid & 0xFF) as u8, flags, 0, 0];
+    if call(dev, dev_idx, reprog_feature_index, 0x3, &params, 400).is_some() {
+        return true;
     }
+    divert && is_cid_diverted(dev, dev_idx, reprog_feature_index, cid)
+}
 
-    let start = Instant::now();
-    let mut resp = [0u8; 32];
-    while start.elapsed() < Duration::from_millis(300) {
-        match file.read(&mut resp) {
-            Ok(n) if n >= 4 => {
-                if resp[0] == REPORT_ID_LONG && resp[1] == dev_idx && resp[2] == reprog_feature_index && resp[3] == 0x30 {
-                    return true;
-                }
-            }
-            Ok(_) => {}
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(_) => break,
+/// Battery (level %, charging) via UNIFIED_BATTERY (0x1004), else BATTERY_STATUS (0x1000).
+pub fn battery_status(dev: &HidDevice, dev_idx: u8) -> Option<(u8, bool)> {
+    if let Some(idx) = query_feature_index(dev, dev_idx, FEATURE_UNIFIED_BATTERY) {
+        // get_status (fn 1): [soc %, level flags, charging status]
+        let r = call(dev, dev_idx, idx, 0x1, &[], 400)?;
+        let charging = matches!(r[6], 1 | 2 | 3);
+        if r[4] > 0 && r[4] <= 100 {
+            return Some((r[4], charging));
         }
     }
-
-    // Double check state if immediate ACK packet was delayed
-    if divert {
-        is_cid_diverted(file, dev_idx, reprog_feature_index, cid)
-    } else {
-        false
+    if let Some(idx) = query_feature_index(dev, dev_idx, FEATURE_BATTERY_STATUS) {
+        let r = call(dev, dev_idx, idx, 0x0, &[], 400)?;
+        let charging = matches!(r[6], 1 | 2 | 3);
+        if r[4] > 0 && r[4] <= 100 {
+            return Some((r[4], charging));
+        }
     }
+    None
+}
+
+/// Candidate HID++ interfaces: (path, product name, vid:pid, is_bluetooth, is_receiver).
+fn hidpp_interfaces() -> Vec<(PathBuf, String, String, bool, bool)> {
+    with_api(|api| {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for d in api.device_list() {
+            if d.vendor_id() != 0x046D {
+                continue;
+            }
+            let ble = d.usage_page() == USAGE_PAGE_HIDPP_BLE;
+            let receiver_long = d.usage_page() == USAGE_PAGE_HIDPP_RECEIVER && d.usage() == 0x0002;
+            if !ble && !receiver_long {
+                continue;
+            }
+            let path = PathBuf::from(d.path().to_string_lossy().to_string());
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let name = d.product_string().unwrap_or("Logitech Device").to_string();
+            if name.to_lowercase().contains("keyboard") {
+                continue;
+            }
+            let vid_pid = format!("{:04x}:{:04x}", d.vendor_id(), d.product_id());
+            let is_bt = matches!(d.bus_type(), hidapi::BusType::Bluetooth) || ble;
+            out.push((path, name, vid_pid, is_bt, receiver_long));
+        }
+        out
+    })
+    .unwrap_or_default()
+}
+
+/// Discovers connected Logitech mice that support reprogrammable controls,
+/// skipping already-monitored paths.
+pub fn discover_logitech_mice(ignored_paths: &HashSet<PathBuf>) -> Vec<LogitechHidDevice> {
+    let mut devices = Vec::new();
+    for (path, name, vid_pid, is_bt, is_receiver) in hidpp_interfaces() {
+        if ignored_paths.contains(&path) {
+            continue;
+        }
+        let Some(dev) = open_path(&path) else { continue };
+        let candidates: Vec<u8> = if is_receiver { vec![1, 2, 3, 4, 5, 6] } else { vec![DEV_INDEX_WIRELESS_OR_BT] };
+        for dev_idx in candidates {
+            flush(&dev);
+            let feat = query_feature_index(&dev, dev_idx, FEATURE_REPROG_CONTROLS_V4)
+                .or_else(|| query_feature_index(&dev, dev_idx, FEATURE_REPROG_CONTROLS));
+            if let Some(feat_idx) = feat {
+                devices.push(LogitechHidDevice {
+                    path: path.clone(),
+                    name: name.clone(),
+                    vid_pid: Some(vid_pid.clone()),
+                    dev_index: dev_idx,
+                    reprog_feature_index: feat_idx,
+                    is_bluetooth: is_bt,
+                });
+                break;
+            }
+        }
+    }
+    devices
 }
 
 /// Maps a Logitech Control ID (CID) to the standard Bo-Ring button code.
 pub fn cid_to_button_code(cid: u16) -> u16 {
     match cid {
-        CID_GESTURE_BUTTON => BTN_RING_CODE, // 278: Thumb rest button
-        CID_SMARTSHIFT_BUTTON => BTN_SMARTSHIFT_CODE, // 280: Mode-shift button
-        CID_APP_SWITCH_BUTTON => BTN_RING_CODE, // 278: M720 thumb gesture button
-        CID_DPI_SWITCH_BUTTON => BTN_SMARTSHIFT_CODE, // 280: MX Vertical / Lift top button
-        CID_PRECISION_BUTTON => BTN_GESTURES_CODE, // 277: MX Ergo precision button
-        0x0053 => BTN_BACK_CODE,     // 275: Back button
-        0x0056 => BTN_FORWARD_CODE,  // 276: Forward button
-        0x0052 => BTN_MIDDLE_CODE,   // 274: Middle click
+        CID_GESTURE_BUTTON => BTN_RING_CODE,
+        CID_SMARTSHIFT_BUTTON => BTN_SMARTSHIFT_CODE,
+        CID_APP_SWITCH_BUTTON => BTN_RING_CODE,
+        CID_DPI_SWITCH_BUTTON => BTN_SMARTSHIFT_CODE,
+        CID_PRECISION_BUTTON => BTN_GESTURES_CODE,
+        CID_HAPTIC_PANEL => BTN_RING_CODE,
+        0x0053 => BTN_BACK_CODE,
+        0x0056 => BTN_FORWARD_CODE,
+        0x0052 => BTN_MIDDLE_CODE,
         other => other,
     }
 }
 
-/// Resolves the list of (Control ID, button_code) to divert for a specific mouse
-/// based on device profiles registered in DeviceRegistry.
+/// (CID, button code) pairs to divert for a mouse, from its device profile.
 pub fn resolve_cids_for_mouse(dev_name: &str, vid_pid: Option<&str>) -> Vec<(u16, u16)> {
     let registry = crate::devices::DeviceRegistry::new();
-    let matched_profile = registry.match_device(dev_name, vid_pid);
-    let mut cids = matched_profile
+    let mut cids = registry
+        .match_device(dev_name, vid_pid)
         .map(|p| p.config.diverted_cids())
         .unwrap_or_default();
-
-    // Fallback if no CIDs were explicitly defined in the profile:
-    // Gesture button (0x00C3 -> BTN_RING_CODE 278)
     if cids.is_empty() {
         cids.push((CID_GESTURE_BUTTON, BTN_RING_CODE));
     }
-
     cids
 }
 
-/// Starts the continuous Logitech HID++ manager thread.
-///
-/// Automatically discovers Logitech mice, enables diversion on all physical controls
-/// declared in their device profile, and streams physical press/release events to the channel.
-pub fn start_hidpp_manager(
-    tx: mpsc::Sender<(String, Option<String>, bool, evdev::InputEvent)>,
-    diverted_devices: Arc<Mutex<HashSet<PathBuf>>>,
-) {
-    thread::spawn(move || {
-        loop {
-            let active_diverted = {
-                let lock = diverted_devices.lock().unwrap();
-                lock.clone()
-            };
-            let mice = discover_logitech_mice(&active_diverted);
-            for mouse in mice {
-                let mut lock = diverted_devices.lock().unwrap();
-                if lock.contains(&mouse.path) {
-                    continue;
-                }
-                lock.insert(mouse.path.clone());
-                drop(lock);
-
-                println!(
-                    "✨ Logitech HID++ 2.0 Device detected: [{:?}] {} (VID:PID {:?}, DevIdx 0x{:02X}, ReprogFeat 0x{:02X})",
-                    mouse.path, mouse.name, mouse.vid_pid, mouse.dev_index, mouse.reprog_feature_index
-                );
-
-                let mouse_clone = mouse.clone();
-                let tx_clone = tx.clone();
-                let diverted_tracker = Arc::clone(&diverted_devices);
-
-                thread::spawn(move || {
-                    let mut file = match open_hidraw(&mouse_clone.path) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            eprintln!("⚠️ Failed to open HID++ device {:?}: {}", mouse_clone.path, e);
-                            let mut lock = diverted_tracker.lock().unwrap();
-                            lock.remove(&mouse_clone.path);
-                            return;
-                        }
-                    };
-
-                    // Resolve declared CIDs dynamically from DeviceRegistry profile
-                    let cids_to_divert = resolve_cids_for_mouse(&mouse_clone.name, mouse_clone.vid_pid.as_deref());
-
-                    for &(cid, code) in &cids_to_divert {
-                        let diverted_ok = set_cid_diverted(
-                            &mut file,
-                            mouse_clone.dev_index,
-                            mouse_clone.reprog_feature_index,
-                            cid,
-                            true,
-                        );
-
-                        if diverted_ok {
-                            println!(
-                                "🎯 Diverted physical control CID 0x{:04X} -> Button Code {} on [{:?}] {}!",
-                                cid, code, mouse_clone.path, mouse_clone.name
-                            );
-                        } else {
-                            println!(
-                                "⚠️ Could not confirm diversion ACK for CID 0x{:04X} on [{:?}], listening for reports anyway.",
-                                cid, mouse_clone.path
-                            );
-                        }
-                    }
-
-                    let cid_map: std::collections::HashMap<u16, u16> = cids_to_divert.into_iter().collect();
-                    flush_hidraw(&mut file);
-
-                    let mut previous_cids: HashSet<u16> = HashSet::new();
-                    let mut buf = [0u8; 64];
-
-                    loop {
-                        match file.read(&mut buf) {
-                            Ok(n) if n >= 12 => {
-                                // Long report (0x11) for ReprogControls (feat_idx), function 0x00 (DivertedButtonEvent)
-                                if buf[0] == REPORT_ID_LONG
-                                    && buf[1] == mouse_clone.dev_index
-                                    && buf[2] == mouse_clone.reprog_feature_index
-                                    && (buf[3] & 0xF0) == 0x00
-                                {
-                                    // Parse up to 4 active 16-bit CIDs
-                                    let mut current_cids = HashSet::new();
-                                    for i in 0..4 {
-                                        let offset = 4 + (i * 2);
-                                        let cid = ((buf[offset] as u16) << 8) | (buf[offset + 1] as u16);
-                                        if cid != 0 {
-                                            current_cids.insert(cid);
-                                        }
-                                    }
-
-                                    // Detect newly pressed CIDs (value = 1)
-                                    for &cid in &current_cids {
-                                        if !previous_cids.contains(&cid) {
-                                            let code = cid_map.get(&cid).copied().unwrap_or_else(|| cid_to_button_code(cid));
-                                            println!(
-                                                "🔘 [HID++ Press] Control 0x{:04X} -> Evdev Code {} on {}",
-                                                cid, code, mouse_clone.name
-                                            );
-                                            let ev = evdev::InputEvent::new(evdev::EventType::KEY, code, 1);
-                                            let _ = tx_clone.send((
-                                                mouse_clone.name.clone(),
-                                                mouse_clone.vid_pid.clone(),
-                                                false, // not an exclusive evdev grab
-                                                ev,
-                                            ));
-                                        }
-                                    }
-
-                                    // Detect released CIDs (value = 0)
-                                    for &cid in &previous_cids {
-                                        if !current_cids.contains(&cid) {
-                                            let code = cid_map.get(&cid).copied().unwrap_or_else(|| cid_to_button_code(cid));
-                                            println!(
-                                                "🔘 [HID++ Release] Control 0x{:04X} -> Evdev Code {} on {}",
-                                                cid, code, mouse_clone.name
-                                            );
-                                            let ev = evdev::InputEvent::new(evdev::EventType::KEY, code, 0);
-                                            let _ = tx_clone.send((
-                                                mouse_clone.name.clone(),
-                                                mouse_clone.vid_pid.clone(),
-                                                false,
-                                                ev,
-                                            ));
-                                        }
-                                    }
-
-                                    previous_cids = current_cids;
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                thread::sleep(Duration::from_millis(8));
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "🔌 HID++ device disconnected or read error {:?}: {}",
-                                    mouse_clone.path, e
-                                );
-                                let mut lock = diverted_tracker.lock().unwrap();
-                                lock.remove(&mouse_clone.path);
-                                break;
-                            }
-                        }
-                    }
-                });
-            }
-
-            thread::sleep(Duration::from_millis(1500));
+/// Parse the pressed CIDs of a divertedButtonsEvent for our device/feature.
+pub fn parse_diverted_buttons(buf: &[u8], dev_idx: u8, feat_idx: u8) -> Option<HashSet<u16>> {
+    if buf.len() < 12 || buf[0] != REPORT_ID_LONG || buf[1] != dev_idx || buf[2] != feat_idx || buf[3] != 0x00 {
+        return None;
+    }
+    let mut set = HashSet::new();
+    for i in 0..4 {
+        let o = 4 + i * 2;
+        let cid = ((buf[o] as u16) << 8) | buf[o + 1] as u16;
+        if cid != 0 {
+            set.insert(cid);
         }
+    }
+    Some(set)
+}
+
+// Everything we diverted, so it can be restored on shutdown.
+static DIVERTED: Mutex<Vec<(PathBuf, u8, u8, Vec<u16>)>> = Mutex::new(Vec::new());
+
+/// Restore every control this process diverted (call on shutdown).
+pub fn undivert_all() {
+    let entries = std::mem::take(&mut *DIVERTED.lock().unwrap());
+    for (path, dev_idx, feat, cids) in entries {
+        if let Some(dev) = open_path(&path) {
+            for cid in cids {
+                if set_cid_diverted(&dev, dev_idx, feat, cid, false) {
+                    println!("↩️ Restored CID 0x{:04X} on {:?}", cid, path);
+                }
+            }
+        }
+    }
+}
+
+/// A physical press/release from a diverted control.
+#[derive(Debug, Clone)]
+pub struct HidppButtonEvent {
+    pub dev_name: String,
+    pub vid_pid: Option<String>,
+    pub code: u16,
+    pub value: i32,
+}
+
+fn run_device_loop(
+    mouse: LogitechHidDevice,
+    tracker: Arc<Mutex<HashSet<PathBuf>>>,
+    mut on_event: impl FnMut(u16, u16, i32),
+    verbose: bool,
+) {
+    let Some(dev) = open_path(&mouse.path) else {
+        tracker.lock().unwrap().remove(&mouse.path);
+        return;
+    };
+    let cids = resolve_cids_for_mouse(&mouse.name, mouse.vid_pid.as_deref());
+    let mut diverted = Vec::new();
+    for &(cid, code) in &cids {
+        flush(&dev);
+        if set_cid_diverted(&dev, mouse.dev_index, mouse.reprog_feature_index, cid, true) {
+            diverted.push(cid);
+            if verbose {
+                println!("🎯 Diverted CID 0x{:04X} -> Button Code {} on {}", cid, code, mouse.name);
+            }
+        } else if verbose {
+            println!("⚠️ No diversion ACK for CID 0x{:04X} on {} (not present?)", cid, mouse.name);
+        }
+    }
+    if !diverted.is_empty() {
+        let mut lock = DIVERTED.lock().unwrap();
+        lock.retain(|e| e.0 != mouse.path);
+        lock.push((mouse.path.clone(), mouse.dev_index, mouse.reprog_feature_index, diverted));
+    }
+    let cid_map: HashMap<u16, u16> = cids.into_iter().collect();
+    let mut previous: HashSet<u16> = HashSet::new();
+    let mut buf = [0u8; 64];
+    loop {
+        match dev.read_timeout(&mut buf, 500) {
+            Ok(0) => {}
+            Ok(n) => {
+                if let Some(current) = parse_diverted_buttons(&buf[..n], mouse.dev_index, mouse.reprog_feature_index) {
+                    for &cid in current.difference(&previous) {
+                        let code = cid_map.get(&cid).copied().unwrap_or_else(|| cid_to_button_code(cid));
+                        on_event(cid, code, 1);
+                    }
+                    for &cid in previous.difference(&current) {
+                        let code = cid_map.get(&cid).copied().unwrap_or_else(|| cid_to_button_code(cid));
+                        on_event(cid, code, 0);
+                    }
+                    previous = current;
+                }
+            }
+            Err(e) => {
+                eprintln!("🔌 HID++ device disconnected / read error {:?}: {}", mouse.path, e);
+                break;
+            }
+        }
+    }
+    tracker.lock().unwrap().remove(&mouse.path);
+    DIVERTED.lock().unwrap().retain(|e| e.0 != mouse.path);
+}
+
+/// Daemon: discover Logitech mice, divert their profile CIDs, stream events.
+pub fn start_hidpp_manager(tx: mpsc::Sender<HidppButtonEvent>, diverted_devices: Arc<Mutex<HashSet<PathBuf>>>) {
+    thread::spawn(move || loop {
+        let ignored = diverted_devices.lock().unwrap().clone();
+        for mouse in discover_logitech_mice(&ignored) {
+            if !diverted_devices.lock().unwrap().insert(mouse.path.clone()) {
+                continue;
+            }
+            println!(
+                "✨ Logitech HID++ 2.0 device: {} ({:?}, {}, DevIdx 0x{:02X}, ReprogFeat 0x{:02X})",
+                mouse.name,
+                mouse.vid_pid,
+                if mouse.is_bluetooth { "Bluetooth" } else { "receiver/USB" },
+                mouse.dev_index,
+                mouse.reprog_feature_index
+            );
+            let tx = tx.clone();
+            let tracker = Arc::clone(&diverted_devices);
+            thread::spawn(move || {
+                let name = mouse.name.clone();
+                let vid_pid = mouse.vid_pid.clone();
+                run_device_loop(
+                    mouse,
+                    tracker,
+                    |cid, code, value| {
+                        println!(
+                            "🔘 [HID++ {}] Control 0x{:04X} -> Code {} on {}",
+                            if value == 1 { "Press" } else { "Release" },
+                            cid,
+                            code,
+                            name
+                        );
+                        let _ = tx.send(HidppButtonEvent { dev_name: name.clone(), vid_pid: vid_pid.clone(), code, value });
+                    },
+                    true,
+                );
+            });
+        }
+        thread::sleep(Duration::from_millis(1500));
     });
 }
 
-/// Attaches direct HID++ listening for the standalone Config UI (fallback when daemon is not running).
+/// Config UI fallback listener (when the daemon is not running).
 pub fn attach_hidpp_gui_listener(
     ctx: eframe::egui::Context,
     tx: mpsc::Sender<crate::devices::MouseInputEvent>,
     diverted_devices: Arc<Mutex<HashSet<PathBuf>>>,
 ) {
-    thread::spawn(move || {
-        loop {
-            let active_diverted = {
-                let lock = diverted_devices.lock().unwrap();
-                lock.clone()
-            };
-            let mice = discover_logitech_mice(&active_diverted);
-            for mouse in mice {
-                let mut lock = diverted_devices.lock().unwrap();
-                if lock.contains(&mouse.path) {
-                    continue;
-                }
-                lock.insert(mouse.path.clone());
-                drop(lock);
-
-                let mouse_clone = mouse.clone();
-                let tx_clone = tx.clone();
-                let ctx_clone = ctx.clone();
-                let diverted_tracker = Arc::clone(&diverted_devices);
-
-                thread::spawn(move || {
-                    let mut file = match open_hidraw(&mouse_clone.path) {
-                        Ok(f) => f,
-                        Err(_) => {
-                            let mut lock = diverted_tracker.lock().unwrap();
-                            lock.remove(&mouse_clone.path);
-                            return;
-                        }
-                    };
-
-                    let cids_to_divert = resolve_cids_for_mouse(&mouse_clone.name, mouse_clone.vid_pid.as_deref());
-
-                    for &(cid, _) in &cids_to_divert {
-                        let _ = set_cid_diverted(
-                            &mut file,
-                            mouse_clone.dev_index,
-                            mouse_clone.reprog_feature_index,
-                            cid,
-                            true,
-                        );
-                    }
-
-                    let cid_map: std::collections::HashMap<u16, u16> = cids_to_divert.into_iter().collect();
-                    flush_hidraw(&mut file);
-
-                    let mut previous_cids: HashSet<u16> = HashSet::new();
-                    let mut buf = [0u8; 64];
-
-                    loop {
-                        match file.read(&mut buf) {
-                            Ok(n) if n >= 12 => {
-                                if buf[0] == REPORT_ID_LONG
-                                    && buf[1] == mouse_clone.dev_index
-                                    && buf[2] == mouse_clone.reprog_feature_index
-                                    && (buf[3] & 0xF0) == 0x00
-                                {
-                                    let mut current_cids = HashSet::new();
-                                    for i in 0..4 {
-                                        let offset = 4 + (i * 2);
-                                        let cid = ((buf[offset] as u16) << 8) | (buf[offset + 1] as u16);
-                                        if cid != 0 {
-                                            current_cids.insert(cid);
-                                        }
-                                    }
-
-                                    for &cid in &current_cids {
-                                        if !previous_cids.contains(&cid) {
-                                            let code = cid_map.get(&cid).copied().unwrap_or_else(|| cid_to_button_code(cid));
-                                            let _ = tx_clone.send(crate::devices::MouseInputEvent {
-                                                code,
-                                                raw_code: code,
-                                                dev_name: Some(mouse_clone.name.clone()),
-                                                vid_pid: mouse_clone.vid_pid.clone(),
-                                            });
-                                            ctx_clone.request_repaint();
-                                        }
-                                    }
-
-                                    previous_cids = current_cids;
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                thread::sleep(Duration::from_millis(10));
-                            }
-                            Err(_) => {
-                                let mut lock = diverted_tracker.lock().unwrap();
-                                lock.remove(&mouse_clone.path);
-                                break;
-                            }
-                        }
-                    }
-                });
+    thread::spawn(move || loop {
+        let ignored = diverted_devices.lock().unwrap().clone();
+        for mouse in discover_logitech_mice(&ignored) {
+            if !diverted_devices.lock().unwrap().insert(mouse.path.clone()) {
+                continue;
             }
-
-            thread::sleep(Duration::from_millis(1500));
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            let tracker = Arc::clone(&diverted_devices);
+            thread::spawn(move || {
+                let name = mouse.name.clone();
+                let vid_pid = mouse.vid_pid.clone();
+                run_device_loop(
+                    mouse,
+                    tracker,
+                    |_cid, code, value| {
+                        if value == 1 {
+                            let _ = tx.send(crate::devices::MouseInputEvent {
+                                code,
+                                raw_code: code,
+                                dev_name: Some(name.clone()),
+                                vid_pid: vid_pid.clone(),
+                            });
+                            ctx.request_repaint();
+                        }
+                    },
+                    false,
+                );
+            });
         }
+        thread::sleep(Duration::from_millis(1500));
     });
+}
+
+/// First reachable Logitech HID++ device's battery (level, charging).
+pub fn query_battery() -> Option<(u8, bool)> {
+    for (path, _name, _vp, _bt, is_receiver) in hidpp_interfaces() {
+        let Some(dev) = open_path(&path) else { continue };
+        let idxs: Vec<u8> = if is_receiver { vec![1, 2, 3, 4, 5, 6] } else { vec![DEV_INDEX_WIRELESS_OR_BT] };
+        for i in idxs {
+            flush(&dev);
+            if let Some(b) = battery_status(&dev, i) {
+                return Some(b);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -586,6 +494,7 @@ mod tests {
         assert_eq!(cid_to_button_code(CID_APP_SWITCH_BUTTON), BTN_RING_CODE);
         assert_eq!(cid_to_button_code(CID_DPI_SWITCH_BUTTON), BTN_SMARTSHIFT_CODE);
         assert_eq!(cid_to_button_code(CID_PRECISION_BUTTON), BTN_GESTURES_CODE);
+        assert_eq!(cid_to_button_code(CID_HAPTIC_PANEL), BTN_RING_CODE);
         assert_eq!(cid_to_button_code(0x0053), BTN_BACK_CODE);
         assert_eq!(cid_to_button_code(0x0056), BTN_FORWARD_CODE);
         assert_eq!(cid_to_button_code(0x0052), BTN_MIDDLE_CODE);
@@ -593,31 +502,37 @@ mod tests {
     }
 
     #[test]
+    fn test_sw_ids_rotate_and_skip_notification_id() {
+        let ids: Vec<u8> = (0..30).map(|_| next_sw_id()).collect();
+        assert!(ids.iter().all(|&i| (0x2..=0xF).contains(&i)));
+        assert!(ids.windows(2).all(|w| w[0] != w[1]));
+    }
+
+    #[test]
+    fn test_long_request_framing() {
+        let r = long_request(0xFF, 0x0D, 0x3, &[0x01, 0xA0, FLAG_DIVERT_ON]);
+        assert_eq!(&r[..7], &[0x11, 0xFF, 0x0D, 0x3E, 0x01, 0xA0, 0x03]);
+        assert_eq!(r.len(), 20);
+    }
+
+    #[test]
     fn test_parse_diverted_button_report() {
         let mut report = [0u8; 20];
         report[0] = REPORT_ID_LONG;
         report[1] = 0xFF;
-        report[2] = 0x0A; // Feature index
-        report[3] = 0x00; // DivertedButtonEvent
-        // Slot 0: CID 0x00C3 (Thumb rest button)
-        report[4] = 0x00;
-        report[5] = 0xC3;
-        // Slot 1: CID 0x0056 (Forward button)
+        report[2] = 0x0D;
+        report[4] = 0x01;
+        report[5] = 0xA0;
         report[6] = 0x00;
-        report[7] = 0x56;
-
-        let mut cids = Vec::new();
-        for i in 0..4 {
-            let offset = 4 + (i * 2);
-            let cid = ((report[offset] as u16) << 8) | (report[offset + 1] as u16);
-            if cid != 0 {
-                cids.push(cid);
-            }
-        }
-
-        assert_eq!(cids, vec![0x00C3, 0x0056]);
-        assert_eq!(cid_to_button_code(cids[0]), BTN_RING_CODE);
-        assert_eq!(cid_to_button_code(cids[1]), BTN_FORWARD_CODE);
+        report[7] = 0xC3;
+        let set = parse_diverted_buttons(&report, 0xFF, 0x0D).unwrap();
+        assert!(set.contains(&0x01A0) && set.contains(&0x00C3) && set.len() == 2);
+        // A reply to our own request (sw id 0xE) is not an event.
+        report[3] = 0x3E;
+        assert!(parse_diverted_buttons(&report, 0xFF, 0x0D).is_none());
+        // Wrong feature index.
+        report[3] = 0x00;
+        assert!(parse_diverted_buttons(&report, 0xFF, 0x0B).is_none());
     }
 
     #[test]
@@ -625,20 +540,13 @@ mod tests {
         let cids = resolve_cids_for_mouse("Wireless Mouse MX Master 2s", Some("046d:b019"));
         assert_eq!(cids, vec![(0x00C3, 278), (0x00C4, 280)]);
 
-        let cids_mx3 = resolve_cids_for_mouse("Logitech MX Master 3S", Some("046d:b034"));
-        assert_eq!(cids_mx3, vec![(0x00C3, 278), (0x00C4, 280)]);
-
         let cids_m720 = resolve_cids_for_mouse("Logitech M720 Triathlon", Some("046d:b015"));
         assert_eq!(cids_m720, vec![(0x00D0, 278)]);
 
-        let cids_vert = resolve_cids_for_mouse("Logitech MX Vertical", Some("046d:b020"));
-        assert_eq!(cids_vert, vec![(0x00FD, 280)]);
-
-        let cids_ergo = resolve_cids_for_mouse("Logitech MX Ergo", Some("046d:b01d"));
-        assert_eq!(cids_ergo, vec![(0x00ED, 277)]);
-
-        let cids_mx4 = resolve_cids_for_mouse("Logitech MX Master 4", Some("046d:c548"));
-        assert_eq!(cids_mx4, vec![(0x00C3, 281), (0x00C4, 280)]);
+        // macOS: the MX Master 4's haptic panel and gesture button are both
+        // silent natively, so both are diverted (plus SmartShift).
+        let cids_mx4 = resolve_cids_for_mouse("MX Master 4", Some("046d:b042"));
+        assert_eq!(cids_mx4, vec![(0x00C3, 281), (0x01A0, 278), (0x00C4, 280)]);
 
         let fallback = resolve_cids_for_mouse("Unknown Logitech Mouse", None);
         assert_eq!(fallback, vec![(0x00C3, 278)]);

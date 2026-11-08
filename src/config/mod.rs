@@ -470,6 +470,54 @@ mod tests {
     }
 
     #[test]
+    fn test_macos_bundle_ids_match_profiles() {
+        let cfg = Config::default_config();
+        let profile_for = |bundle: &str| {
+            cfg.app_profiles.iter().find(|p| matches_app_id(&p.app_id, bundle)).map(|p| p.app_id.clone())
+        };
+        for (bundle, expect) in [
+            ("org.mozilla.firefox", "firefox"),
+            ("com.google.Chrome", "safari"),
+            ("com.apple.Safari", "safari"),
+            ("com.microsoft.VSCode", "vscode"),
+            ("com.apple.finder", "finder"),
+            ("org.blenderfoundation.blender", "blender"),
+        ] {
+            let found = profile_for(bundle).unwrap_or_default();
+            assert!(found.contains(expect), "{bundle} should match a profile containing {expect}, got '{found}'");
+        }
+        assert!(profile_for("com.apple.Terminal").is_none());
+        assert!(profile_for("Global / Desktop").is_none());
+    }
+
+    #[test]
+    fn test_presets_use_mac_shortcuts() {
+        // App presets were converted from Ctrl to Cmd (except Ctrl+Tab tab switching).
+        let cfg = Config::default_config();
+        let mut ctrl_combos = Vec::new();
+        fn walk(items: &[RingMenuItemConfig], out: &mut Vec<Vec<String>>) {
+            for it in items {
+                if let Some(ButtonActionConfig::KeyCombo { keys }) = &it.action {
+                    out.push(keys.clone());
+                }
+                for sub in &it.items {
+                    if let Some(ButtonActionConfig::KeyCombo { keys }) = &sub.action {
+                        out.push(keys.clone());
+                    }
+                }
+            }
+        }
+        for p in &cfg.app_profiles {
+            walk(&p.ring_menu.as_ref().unwrap().items, &mut ctrl_combos);
+        }
+        let offenders: Vec<_> = ctrl_combos
+            .iter()
+            .filter(|k| k.iter().any(|x| x == "CTRL") && !k.iter().any(|x| x == "Tab" || x == "CMD"))
+            .collect();
+        assert!(offenders.is_empty(), "Linux-style Ctrl shortcuts left in presets: {offenders:?}");
+    }
+
+    #[test]
     fn test_app_profile_ring_loading() {
         let cfg = Config::default_config();
         assert!(!cfg.app_profiles.is_empty());

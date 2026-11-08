@@ -39,6 +39,11 @@ pub fn run_ring_menu_window(
 
     let options = eframe::NativeOptions {
         viewport: builder,
+        // Accessory app: no Dock icon / app switcher entry for the overlay.
+        event_loop_builder: Some(Box::new(|b| {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+            b.with_activation_policy(ActivationPolicy::Accessory);
+        })),
         ..Default::default()
     };
 

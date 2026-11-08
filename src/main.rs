@@ -14,12 +14,10 @@ mod ring_menu;
 use config::{ButtonActionConfig, Config};
 use config_ui::run_config_gui;
 use devices::{is_supported_button_code, normalize_button_code, BTN_LEFT_CODE, BTN_RIGHT_CODE};
-use evdev::enumerate;
 use platform::ipc::{broadcast_button_event, DaemonIpcCommand, IpcClients};
 use ring_menu::{execute_action_direct, run_ring_menu_window};
 use std::collections::HashSet;
 use std::env;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -27,16 +25,23 @@ use std::time::Duration;
 
 static RING_BUTTON_HELD: AtomicBool = AtomicBool::new(false);
 
+/// A physical button transition from any source (event tap or HID++).
+struct InputEvent {
+    dev_name: String,
+    vid_pid: Option<String>,
+    code: u16,
+    value: i32,
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    // Uninstall mode: `bo-ring --uninstall`
     if args.iter().any(|arg| arg == "--uninstall") {
         uninstall::run_uninstall();
         return;
     }
 
-    // Ring Menu mode: `cargo run -- --ring`
+    // Ring Menu mode: `bo-ring --ring [--app <bundle id>]`
     if args.iter().any(|arg| arg == "--ring") {
         println!("🚀 Launching Ring Menu...");
         let initial_app = args.windows(2).find(|w| w[0] == "--app").map(|w| w[1].clone());
@@ -46,252 +51,165 @@ fn main() {
         return;
     }
 
-    // Daemon mode: `cargo run -- --daemon`
-    let is_daemon_mode = args.iter().any(|arg| arg == "--daemon");
+    // `bo-ring --install-agent` — install + start the daemon LaunchAgent.
+    if args.iter().any(|arg| arg == "--install-agent") {
+        match autostart::enable_systemd_service() {
+            Ok(()) => println!("✅ LaunchAgent {} installed and started.", autostart::DAEMON_LABEL),
+            Err(e) => {
+                eprintln!("❌ LaunchAgent install failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
-    // Default mode (no args or --config): Open Configuration GUI
-    if !is_daemon_mode && !args.iter().any(|arg| arg == "--ring") {
-        println!("🎛️ Launching Configuration Menu (Logi Options+ Style)...");
+    // `bo-ring --toggle` — ask the running daemon to toggle the ring (bind to any hotkey tool).
+    if args.iter().any(|arg| arg == "--toggle") {
+        if !platform::ipc::send_command_to_daemon(&DaemonIpcCommand::ToggleRing) {
+            eprintln!("⚠️ Daemon not running (start it with `bo-ring --daemon`).");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if !args.iter().any(|arg| arg == "--daemon") {
+        println!("🎛️ Launching Configuration Menu...");
         let config = Config::load_or_default();
         run_config_gui(config);
         return;
     }
 
-    println!("=== Bo-Ring - Daemon & Actions Ring ===");
-    keyboard::init_layout_detection();
-    keyboard::init_virtual_keyboard();
-    autostart::ensure_gnome_show_desktop_keybinding();
-    ring_menu::cleanup_stale_ring_pid();
-    let config = Config::load_or_default();
+    run_daemon();
+}
 
+fn run_daemon() {
+    println!("=== Bo-Ring (macOS) - Daemon & Actions Ring ===");
+    install_shutdown_handler();
+    keyboard::init_layout_detection();
+    ring_menu::cleanup_stale_ring_pid();
+
+    if !platform::permissions::accessibility_granted() {
+        println!("🔐 Accessibility permission missing — prompting (needed to capture buttons & send shortcuts).");
+        platform::permissions::prompt_accessibility();
+    }
+    if !platform::permissions::input_monitoring_granted() {
+        println!("🔐 Input Monitoring permission missing — prompting (needed for Logitech HID++ buttons).");
+        platform::permissions::request_input_monitoring();
+    }
+
+    let config = Config::load_or_default();
     println!("✅ Configuration ready:");
     println!("   - Target device: {}", config.general.device_name);
     println!("   - Configured buttons: {}", config.buttons.len());
     println!("   - Ring Menu slots: {}", config.ring_menu.items.len());
 
-    let (tx, rx) = mpsc::channel();
-    let monitored_paths = start_hotplug_and_device_manager(tx.clone());
+    let button_mappings = Arc::new(std::sync::RwLock::new(config.buttons));
+    let (tx, rx) = mpsc::channel::<InputEvent>();
+
+    // Standard extra buttons (middle / back / forward / …) via CGEventTap.
+    let (tap_tx, tap_rx) = mpsc::channel::<platform::event_tap::ButtonEvent>();
+    platform::event_tap::start_event_tap(tap_tx, Arc::clone(&button_mappings));
+    {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let name = devices::scan_mouse_device().map(|m| (m.name, m.vid_pid)).unwrap_or(("Mouse".into(), None));
+            for ev in tap_rx {
+                let _ = tx.send(InputEvent { dev_name: name.0.clone(), vid_pid: name.1.clone(), code: ev.code, value: ev.value });
+            }
+        });
+    }
+
+    // Logitech special controls (gesture button, haptic panel, SmartShift…) via HID++.
+    let (hid_tx, hid_rx) = mpsc::channel::<devices::HidppButtonEvent>();
     let diverted_hidpp = Arc::new(Mutex::new(HashSet::new()));
-    devices::hidpp::start_hidpp_manager(tx.clone(), Arc::clone(&diverted_hidpp));
-    start_dbus_sleep_listener(Arc::clone(&monitored_paths), Arc::clone(&diverted_hidpp));
+    devices::hidpp::start_hidpp_manager(hid_tx, Arc::clone(&diverted_hidpp));
+    {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            for ev in hid_rx {
+                let _ = tx.send(InputEvent { dev_name: ev.dev_name, vid_pid: ev.vid_pid, code: ev.code, value: ev.value });
+            }
+        });
+    }
+    start_wake_listener(Arc::clone(&diverted_hidpp));
 
     println!("\n========================================================");
-    println!(">>> Daemon active with dynamic hotplug & sleep resume recovery.");
-    println!(">>> Press the Action Ring button (BTN_RING / 278) to open the menu.");
+    println!(">>> Daemon active (event tap + HID++ with reconnect & wake recovery).");
+    println!(">>> Press the configured Action Ring button to open the menu.");
     println!("========================================================\n");
 
-    let button_mappings = Arc::new(std::sync::RwLock::new(config.buttons));
     let ipc_clients = start_ipc_server(Arc::clone(&button_mappings));
 
-    while let Ok((dev_name, vid_pid, is_grabbed, event)) = rx.recv() {
-        let raw_code = event.code();
+    while let Ok(ev) = rx.recv() {
+        let raw_code = ev.code;
         let code = normalize_button_code(raw_code);
-        let is_key_event = event.event_type() == evdev::EventType::KEY;
-
         let is_primary_click = raw_code == BTN_LEFT_CODE || raw_code == BTN_RIGHT_CODE;
         let mappings_guard = button_mappings.read().unwrap();
-        let is_remapped = !is_primary_click && is_key_event && (mappings_guard.contains_key(&raw_code) || mappings_guard.contains_key(&code));
+        let is_remapped = !is_primary_click && (mappings_guard.contains_key(&raw_code) || mappings_guard.contains_key(&code));
 
-        // Broadcast physical button press/release events to IPC clients (Config UI listening mode)
-        if is_key_event && is_supported_button_code(raw_code) {
-            broadcast_button_event(&ipc_clients, raw_code, code, event.value(), vid_pid.as_deref(), Some(&dev_name));
+        if is_supported_button_code(raw_code) {
+            broadcast_button_event(&ipc_clients, raw_code, code, ev.value, ev.vid_pid.as_deref(), Some(&ev.dev_name));
         }
 
-        if is_key_event && is_remapped {
-            let action = mappings_guard.get(&raw_code).or_else(|| mappings_guard.get(&code));
-            if matches!(action, Some(ButtonActionConfig::ShowRingMenu)) {
-                if event.value() == 1 {
-                    RING_BUTTON_HELD.store(true, Ordering::SeqCst);
-                } else if event.value() == 0 {
-                    RING_BUTTON_HELD.store(false, Ordering::SeqCst);
-                    keyboard::nudge_mouse();
-                }
-            }
+        if !is_remapped {
+            // Not remapped: the event tap already let the click through.
+            continue;
         }
+        let action = mappings_guard.get(&raw_code).or_else(|| mappings_guard.get(&code)).cloned();
+        drop(mappings_guard);
 
-        if is_remapped {
-            // Remapped button: absorb original click and trigger custom action on press (value == 1)
-            if event.value() == 1 {
-                let action = mappings_guard.get(&raw_code).or_else(|| mappings_guard.get(&code)).cloned();
-                drop(mappings_guard);
-                if let Some(action) = action {
-                    println!("🔘 Button pressed (Raw code {} -> Normalized {}) -> Configured action: {:?}", raw_code, code, action);
-                    match action {
-                        ButtonActionConfig::ShowRingMenu => {
-                            toggle_ring_menu();
-                        }
-                        _ => {
-                            execute_action_direct(&action);
-                        }
-                    }
+        if matches!(action, Some(ButtonActionConfig::ShowRingMenu)) {
+            RING_BUTTON_HELD.store(ev.value == 1, Ordering::SeqCst);
+        }
+        if ev.value == 1 {
+            if let Some(action) = action {
+                println!("🔘 Button pressed (Raw {} -> Normalized {}) -> {:?}", raw_code, code, action);
+                match action {
+                    ButtonActionConfig::ShowRingMenu => toggle_ring_menu(),
+                    _ => execute_action_direct(&action),
                 }
-            }
-        } else {
-            drop(mappings_guard);
-            // Unmapped event: pass through to system ONLY if this device was exclusively grabbed
-            if is_grabbed {
-                keyboard::passthrough_event(&event);
             }
         }
     }
 }
 
-fn start_hotplug_and_device_manager(
-    tx: mpsc::Sender<(String, Option<String>, bool, evdev::InputEvent)>,
-) -> Arc<Mutex<HashSet<PathBuf>>> {
-    let monitored_paths: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
-    let monitored_paths_clone = Arc::clone(&monitored_paths);
+/// SIGTERM / SIGINT / SIGHUP: restore diverted Logitech controls, remove the
+/// socket, exit. Signals are blocked in every thread and consumed by one
+/// `sigwait` thread, so the cleanup runs in normal (non-handler) context.
+fn install_shutdown_handler() {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::sigaddset(&mut set, sig);
+        }
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        let set_copy = set;
+        thread::spawn(move || {
+            let mut sig: libc::c_int = 0;
+            libc::sigwait(&set_copy, &mut sig);
+            println!("\n🛑 Signal {} received — restoring diverted controls…", sig);
+            devices::hidpp::undivert_all();
+            let _ = std::fs::remove_file(daemon_socket_path());
+            std::process::exit(0);
+        });
+    }
+}
 
-    // Continuous hotplug thread (scans /dev/input/event* every 1.5 seconds)
+/// After sleep/wake the mouse may have power-cycled and lost its diversion.
+/// Detect wake by watching for a wall-clock jump and force re-discovery.
+fn start_wake_listener(diverted_hidpp: Arc<Mutex<HashSet<std::path::PathBuf>>>) {
     thread::spawn(move || {
+        let mut last = std::time::SystemTime::now();
         loop {
-            scan_and_attach_devices(&tx, &monitored_paths_clone);
-            thread::sleep(Duration::from_millis(1500));
-        }
-    });
-
-    monitored_paths
-}
-
-fn scan_and_attach_devices(
-    tx: &mpsc::Sender<(String, Option<String>, bool, evdev::InputEvent)>,
-    monitored_paths: &Arc<Mutex<HashSet<PathBuf>>>,
-) {
-    for (path, device) in enumerate() {
-        let name = device.name().unwrap_or("Unknown device");
-        let name_lower = name.to_lowercase();
-
-        // Skip keyboards explicitly
-        if name_lower.contains("keyboard") {
-            continue;
-        }
-
-        // Capability-based detection: any device with BTN_LEFT is a mouse candidate
-        let supported = device.supported_keys();
-        let has_mouse_btn = supported.map_or(false, |keys| keys.contains(evdev::Key::BTN_LEFT));
-        let has_letter_keys = supported.map_or(false, |keys| keys.contains(evdev::Key::KEY_A));
-
-        // Skip devices that are clearly not mice (no mouse button, or keyboard-only)
-        if !has_mouse_btn || (has_letter_keys && !has_mouse_btn) {
-            continue;
-        }
-
-        {
-
-            let mut lock = monitored_paths.lock().unwrap();
-            if lock.contains(&path) {
-                continue;
+            thread::sleep(Duration::from_secs(5));
+            let now = std::time::SystemTime::now();
+            if now.duration_since(last).map(|d| d > Duration::from_secs(30)).unwrap_or(false) {
+                println!("☀️ System wake detected — re-applying HID++ diversion.");
+                ring_menu::cleanup_stale_ring_pid();
+                diverted_hidpp.lock().unwrap().clear();
             }
-            lock.insert(path.clone());
-            drop(lock);
-
-            println!("🔌 Monitored input device attached: [{:?}] {}", path, name);
-
-            let tx_clone = tx.clone();
-            let name_str = name.to_string();
-            let path_clone = path.clone();
-            let monitored_paths_thread = Arc::clone(monitored_paths);
-
-            thread::spawn(move || {
-                let mut dev = match evdev::Device::open(&path_clone) {
-                    Ok(dev) => dev,
-                    Err(e) => {
-                        eprintln!("⚠️ Failed to open {:?}: {} (check udev / input permissions)", path_clone, e);
-                        let mut lock = monitored_paths_thread.lock().unwrap();
-                        lock.remove(&path_clone);
-                        return;
-                    }
-                };
-
-                let input_id = dev.input_id();
-                let vid_pid = format!("{:04x}:{:04x}", input_id.vendor(), input_id.product());
-
-                let is_receiver_only = name_lower.ends_with("receiver") && !name_lower.contains("mouse");
-                let should_grab = has_mouse_btn && !has_letter_keys && !is_receiver_only;
-
-                let is_grabbed = if should_grab {
-                    match dev.grab() {
-                        Ok(()) => {
-                            println!("🔒 Exclusive grab enabled on {:?} [{}] — {}", path_clone, vid_pid, name_lower);
-                            true
-                        }
-                        Err(e) => {
-                            eprintln!("⚠️ Failed to enable exclusive grab on {:?}: {}", path_clone, e);
-                            false
-                        }
-                    }
-                } else {
-                    println!("👂 Listening (no grab) on {:?} [{}] — {}", path_clone, vid_pid, name_lower);
-                    false
-                };
-
-                loop {
-                    match dev.fetch_events() {
-                        Ok(events) => {
-                            for ev in events {
-                                if is_grabbed {
-                                    if ev.event_type() == evdev::EventType::RELATIVE {
-                                        // Pass through pointer motion and scroll wheel immediately
-                                        keyboard::passthrough_event(&ev);
-                                    } else if ev.event_type() == evdev::EventType::KEY {
-                                        let raw_code = ev.code();
-                                        if raw_code == BTN_LEFT_CODE || raw_code == BTN_RIGHT_CODE {
-                                            keyboard::passthrough_event(&ev);
-                                        } else {
-                                            let _ = tx_clone.send((name_str.clone(), Some(vid_pid.clone()), is_grabbed, ev));
-                                        }
-                                    }
-                                } else {
-                                    if ev.event_type() == evdev::EventType::KEY {
-                                        let raw_code = ev.code();
-                                        if is_supported_button_code(raw_code) {
-                                            let _ = tx_clone.send((name_str.clone(), Some(vid_pid.clone()), is_grabbed, ev));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("⚠️ Device disconnected or read error on {:?}: {}. Unregistering for re-enumeration.", path_clone, e);
-                            let mut lock = monitored_paths_thread.lock().unwrap();
-                            lock.remove(&path_clone);
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-    }
-}
-
-fn start_dbus_sleep_listener(
-    monitored_paths: Arc<Mutex<HashSet<PathBuf>>>,
-    diverted_hidpp: Arc<Mutex<HashSet<PathBuf>>>,
-) {
-    thread::spawn(move || {
-        let child = std::process::Command::new("dbus-monitor")
-            .args(["--system", "type='signal',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'"])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-
-        if let Ok(mut child) = child {
-            if let Some(stdout) = child.stdout.take() {
-                use std::io::{BufRead, BufReader};
-                let reader = BufReader::new(stdout);
-                for line in reader.lines().map_while(Result::ok) {
-                    // PrepareForSleep boolean signal: false means system woke up from sleep
-                    if line.contains("boolean false") {
-                        println!("☀️ System wake up (resume from sleep) detected via D-Bus!");
-                        ring_menu::cleanup_stale_ring_pid();
-                        keyboard::reset_virtual_keyboard();
-                        let mut lock = monitored_paths.lock().unwrap();
-                        lock.clear();
-                        let mut hidpp_lock = diverted_hidpp.lock().unwrap();
-                        hidpp_lock.clear();
-                    }
-                }
-            }
+            last = now;
         }
     });
 }
@@ -299,23 +217,21 @@ fn start_dbus_sleep_listener(
 fn execute_action_daemon_delayed(action: &ButtonActionConfig) {
     let resolved = config::resolve_action(action, &[]);
     match &resolved {
-        ButtonActionConfig::ShowRingMenu | ButtonActionConfig::ActionRef { .. } => {},
-        ButtonActionConfig::Command { cmd: _ } => {
-            execute_action_direct(&resolved);
-        }
+        ButtonActionConfig::ShowRingMenu | ButtonActionConfig::ActionRef { .. } => {}
+        ButtonActionConfig::Command { .. } => execute_action_direct(&resolved),
         ButtonActionConfig::KeyCombo { keys } => {
             let keys_to_send = keys.clone();
             let is_media_key = keys.iter().any(|k| {
                 let norm = k.trim().to_lowercase();
                 norm.contains("volume") || norm.contains("mute") || norm.contains("play") || norm.contains("song")
             });
-
             if is_media_key {
                 keyboard::send_key_combo(&keys_to_send);
             } else {
                 thread::spawn(move || {
+                    // The ring overlay (a separate process) took focus; hand it
+                    // back to the app the user summoned the ring over.
                     active_window::focus_window_under_cursor();
-                    // Give Wayland/Mutter 180ms to restore focus to the target app window after ring menu closes
                     thread::sleep(Duration::from_millis(180));
                     keyboard::send_key_combo(&keys_to_send);
                 });
@@ -402,7 +318,7 @@ fn toggle_ring_menu() {
         if let Ok(content) = std::fs::read_to_string(&pid_path) {
             if let Ok(pid) = content.trim().parse::<i32>() {
                 if pid != current_pid {
-                    let is_alive = std::path::Path::new(&format!("/proc/{}", pid)).exists();
+                    let is_alive = platform::overlay::is_pid_alive(pid);
                     if is_alive && ring_menu::terminate_ring_process(pid) {
                         println!("⏹️ Closed active Ring Menu (PID {})...", pid);
                         let _ = std::fs::remove_file(&pid_path);
@@ -415,6 +331,9 @@ fn toggle_ring_menu() {
     }
 
     let active_app = active_window::detect_active_window();
+    if let Some((_, _, pid)) = active_window::frontmost_app() {
+        platform::overlay::set_last_target_pid(pid);
+    }
 
     println!("✨ Opening Ring Menu! (Detected active app: {})", active_app);
     let exe = env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("bo-ring"));

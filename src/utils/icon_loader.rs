@@ -11,7 +11,10 @@ pub fn setup_custom_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
     let font_paths = [
-        "/usr/share/fonts/gdouros-symbola/Symbola.ttf",
+        // macOS system fallbacks (egui already bundles a NotoEmoji subset)
+        "/System/Library/Fonts/Apple Symbols.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/Library/Fonts/Symbola.ttf",
         "/usr/share/fonts/google-noto-emoji-fonts/NotoEmoji-Regular.ttf",
         "/usr/share/fonts/google-noto/NotoSansSymbols2-Regular.ttf",
         "/usr/share/fonts/google-noto-vf/NotoSansSymbols[wght].ttf",

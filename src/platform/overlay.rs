@@ -1,334 +1,165 @@
+//! Overlay window helpers for macOS: per-user runtime paths, the ring PID
+//! file, and the transparent full-screen viewport placed on the display under
+//! the cursor.
+
 use eframe::egui;
+use objc2_app_kit::NSScreen;
+use objc2_foundation::MainThreadMarker;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicI32, Ordering};
 
-/// Get the work area dimensions (monitor height minus shell chrome like GNOME top bar).
-///
-/// Tries multiple strategies in order of accuracy:
-/// 1. GNOME Shell Extension DBus (active monitor where cursor is)
-/// 2. GNOME Mutter DBus DisplayConfig (primary monitor resolution & scale)
-/// 3. Hyprland IPC (`hyprctl monitors -j`)
-/// 4. Sway / wlroots IPC (`swaymsg -t get_outputs`)
-/// 5. X11 / XWayland (`_NET_WORKAREA` via `xprop` + `xrandr`)
-/// 6. Linux DRM sysfs modes (`/sys/class/drm/*/modes`, sorted by resolution)
-pub fn get_work_area_size() -> Option<(f32, f32)> {
-    // 1. Try GNOME Shell Extension DBus (exact active monitor containing the cursor)
-    if let Some(dims) = get_work_area_gnome_extension() {
-        return Some(dims);
-    }
-
-    // 2. Try GNOME Mutter DBus (primary monitor geometry from compositor)
-    if let Some(dims) = get_work_area_mutter() {
-        return Some(dims);
-    }
-
-    // 3. Try Hyprland IPC
-    if let Ok(output) = std::process::Command::new("hyprctl").args(["monitors", "-j"]).output() {
-        if output.status.success() {
-            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                if let Some(arr) = val.as_array() {
-                    for mon in arr {
-                        let is_focused = mon.get("focused").and_then(|v| v.as_bool()).unwrap_or(false);
-                        if is_focused || arr.len() == 1 {
-                            if let (Some(w), Some(h)) = (mon.get("width").and_then(|v| v.as_f64()), mon.get("height").and_then(|v| v.as_f64())) {
-                                let scale = mon.get("scale").and_then(|v| v.as_f64()).unwrap_or(1.0);
-                                return Some(((w / scale) as f32, (h / scale) as f32));
-                            }
-                        }
-                    }
-                }
-            }
+/// Per-user runtime directory. Uses `confstr(_CS_DARWIN_USER_TEMP_DIR)` rather
+/// than `$TMPDIR`, because launchd agents may run without `TMPDIR` set and the
+/// daemon, ring and config UI must agree on the socket / PID file location.
+pub fn runtime_dir() -> PathBuf {
+    let mut buf = vec![0u8; 1024];
+    let n = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if n > 1 && (n as usize) <= buf.len() {
+        buf.truncate(n as usize - 1);
+        if let Ok(s) = String::from_utf8(buf) {
+            return PathBuf::from(s);
         }
     }
-
-    // 4. Try Sway / wlroots IPC
-    if let Ok(output) = std::process::Command::new("swaymsg").args(["-t", "get_outputs"]).output() {
-        if output.status.success() {
-            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                if let Some(arr) = val.as_array() {
-                    for mon in arr {
-                        let is_focused = mon.get("focused").and_then(|v| v.as_bool()).unwrap_or(false);
-                        if is_focused || arr.len() == 1 {
-                            if let Some(rect) = mon.get("rect") {
-                                if let (Some(w), Some(h)) = (rect.get("width").and_then(|v| v.as_f64()), rect.get("height").and_then(|v| v.as_f64())) {
-                                    return Some((w as f32, h as f32));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 5. Try X11 / XWayland with xrandr + xprop
-    if let Some(dims) = get_work_area_x11() {
-        return Some(dims);
-    }
-
-    // 6. Try Linux DRM sysfs modes (sorted by resolution)
-    if let Some(dims) = get_work_area_drm() {
-        return Some(dims);
-    }
-
-    None
-}
-
-fn get_work_area_gnome_extension() -> Option<(f32, f32)> {
-    let output = std::process::Command::new("gdbus")
-        .args([
-            "call",
-            "--session",
-            "--dest",
-            "org.gnome.Shell",
-            "--object-path",
-            "/org/boring/WindowTracker",
-            "--method",
-            "org.boring.WindowTracker.GetActiveMonitorWorkArea",
-        ])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let clean = stdout.trim().trim_matches(|c| c == '(' || c == ')' || c == ' ');
-    let nums: Vec<f32> = clean
-        .split(',')
-        .filter_map(|s| s.trim().parse::<f32>().ok())
-        .collect();
-
-    if nums.len() >= 4 {
-        let w = nums[2];
-        let h = nums[3];
-        if w >= 640.0 && h >= 480.0 {
-            return Some((w, h));
-        }
-    }
-    None
-}
-
-fn get_work_area_mutter() -> Option<(f32, f32)> {
-    let output = std::process::Command::new("gdbus")
-        .args([
-            "call",
-            "--session",
-            "--dest",
-            "org.gnome.Mutter.DisplayConfig",
-            "--object-path",
-            "/org/gnome/Mutter/DisplayConfig",
-            "--method",
-            "org.gnome.Mutter.DisplayConfig.GetCurrentState",
-        ])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Search for primary logical monitor (contains "true, [('")
-    let mut connector = None;
-    let mut scale = 1.0_f32;
-
-    let marker = "true, [('";
-    if let Some(pos) = stdout.find(marker) {
-        let rest = &stdout[pos + marker.len()..];
-        if let Some(end) = rest.find('\'') {
-            connector = Some(rest[..end].to_string());
-        }
-        let start = pos.saturating_sub(40);
-        let prefix = &stdout[start..pos];
-        for p in prefix.split(',') {
-            if let Ok(s) = p.trim().parse::<f32>() {
-                if (0.5..=4.0).contains(&s) {
-                    scale = s;
-                }
-            }
-        }
-    }
-
-    // Fallback: search for any logical monitor connector
-    if connector.is_none() {
-        let marker2 = "[('";
-        if let Some(pos2) = stdout.find(marker2) {
-            let rest2 = &stdout[pos2 + marker2.len()..];
-            if let Some(end2) = rest2.find('\'') {
-                connector = Some(rest2[..end2].to_string());
-            }
-        }
-    }
-
-    let conn = connector?;
-    let conn_marker = format!("(('{}'", conn);
-    let conn_pos = stdout.find(&conn_marker)?;
-    let conn_chunk = &stdout[conn_pos..];
-
-    // Find active mode in this connector's block
-    let cur_marker = "'is-current': <true>";
-    let cur_pos = conn_chunk.find(cur_marker)?;
-    let sub = &conn_chunk[..cur_pos];
-    let last_paren = sub.rfind('(')?;
-    let mode_tuple = &sub[last_paren..];
-    let parts: Vec<&str> = mode_tuple.split(',').collect();
-    if parts.len() >= 3 {
-        let w: f32 = parts[1].trim().parse().ok()?;
-        let h: f32 = parts[2].trim().parse().ok()?;
-        let logical_w = w / scale;
-        let logical_h = (h / scale).max(100.0);
-        return Some((logical_w, logical_h));
-    }
-
-    None
-}
-
-fn get_work_area_drm() -> Option<(f32, f32)> {
-    let mut modes = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let status_file = path.join("status");
-            if let Ok(status) = std::fs::read_to_string(&status_file) {
-                if !status.trim().eq_ignore_ascii_case("connected") {
-                    continue;
-                }
-            }
-            let mode_file = path.join("modes");
-            if let Ok(content) = std::fs::read_to_string(&mode_file) {
-                if let Some(first_line) = content.lines().next() {
-                    let parts: Vec<&str> = first_line.trim().split('x').collect();
-                    if parts.len() == 2 {
-                        if let (Ok(w), Ok(h)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>()) {
-                            if w > 0.0 && h > 0.0 {
-                                modes.push((w, h));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    modes.sort_by(|a, b| (b.0 * b.1).partial_cmp(&(a.0 * a.1)).unwrap_or(std::cmp::Ordering::Equal));
-    if let Some((w, h)) = modes.first() {
-        return Some((*w, (*h).max(100.0)));
-    }
-    None
-}
-
-
-fn get_work_area_x11() -> Option<(f32, f32)> {
-    let top_bar_height = std::process::Command::new("xprop")
-        .args(["-root", "_NET_WORKAREA"])
-        .output()
-        .ok()
-        .and_then(|output| {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let values_part = stdout.split('=').nth(1)?;
-            let nums: Vec<f32> = values_part
-                .split(',')
-                .take(4)
-                .filter_map(|s| s.trim().parse::<f32>().ok())
-                .collect();
-            if nums.len() >= 4 { Some(nums[1]) } else { None }
-        })
-        .unwrap_or(32.0);
-
-    if let Ok(output) = std::process::Command::new("xrandr").arg("--current").output() {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if line.contains(" connected") && line.contains("primary") {
-                    for word in line.split_whitespace() {
-                        if word.contains('x') && word.contains('+') {
-                            let parts: Vec<&str> = word.split(|c| c == 'x' || c == '+').collect();
-                            if parts.len() >= 2 {
-                                let w: f32 = parts[0].parse().ok()?;
-                                let h: f32 = parts[1].parse().ok()?;
-                                return Some((w, h - top_bar_height));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
+    std::env::temp_dir()
 }
 
 pub fn ring_pid_file_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(dir).join("bo-ring-ring.pid")
-    } else {
-        PathBuf::from("/tmp/bo-ring-ring.pid")
-    }
+    runtime_dir().join("bo-ring-ring.pid")
 }
 
-pub fn is_pid_boring(pid: i32) -> bool {
-    let cmdline_path = format!("/proc/{}/cmdline", pid);
-    if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
-        return cmdline.contains("bo-ring");
+/// Global cursor position in Quartz coordinates (origin top-left of the main display, points).
+pub fn global_cursor_pos() -> (f32, f32) {
+    use core_graphics::event::CGEvent;
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+        .ok()
+        .and_then(|s| CGEvent::new(s).ok())
+        .map(|e| {
+            let p = e.location();
+            (p.x as f32, p.y as f32)
+        })
+        .unwrap_or((0.0, 0.0))
+}
+
+/// Frame (x, y, w, h) in top-left global points of the screen containing the
+/// cursor, as (full frame, visible frame).
+fn screen_under_cursor() -> Option<((f32, f32, f32, f32), (f32, f32, f32, f32))> {
+    let mtm = MainThreadMarker::new()?;
+    let (cx, cy) = global_cursor_pos();
+    let screens = NSScreen::screens(mtm);
+    let primary_h = unsafe { screens.firstObject() }.map(|s| s.frame().size.height as f32)?;
+    let flip = |r: objc2_foundation::NSRect| {
+        let x = r.origin.x as f32;
+        let w = r.size.width as f32;
+        let h = r.size.height as f32;
+        let y = primary_h - (r.origin.y as f32 + h);
+        (x, y, w, h)
+    };
+    let mut best = None;
+    for s in screens.iter() {
+        let f = flip(s.frame());
+        if cx >= f.0 && cx < f.0 + f.2 && cy >= f.1 && cy < f.1 + f.3 {
+            best = Some((f, flip(s.visibleFrame())));
+            break;
+        }
     }
-    false
+    best.or_else(|| unsafe { screens.firstObject() }.map(|s| (flip(s.frame()), flip(s.visibleFrame()))))
+}
+
+static OVERLAY_ORIGIN: Mutex<(f32, f32)> = Mutex::new((0.0, 0.0));
+
+/// The ring centre in overlay-window coordinates: the real cursor position.
+/// (Replaces the Wayland "wait for a motion event after a uinput nudge" dance.)
+pub fn ring_center_in_window() -> egui::Pos2 {
+    let (cx, cy) = global_cursor_pos();
+    let (ox, oy) = *OVERLAY_ORIGIN.lock().unwrap();
+    egui::pos2(cx - ox, cy - oy)
+}
+
+pub fn get_work_area_size() -> Option<(f32, f32)> {
+    screen_under_cursor().map(|(_, v)| (v.2, v.3))
+}
+
+pub fn build_ring_overlay_viewport() -> egui::ViewportBuilder {
+    // Cover the whole display under the cursor (menu bar and Dock included) so
+    // the ring can be centred on the pointer anywhere.
+    let (x, y, w, h) = screen_under_cursor().map(|(f, _)| f).unwrap_or((0.0, 0.0, 1440.0, 900.0));
+    *OVERLAY_ORIGIN.lock().unwrap() = (x, y);
+    println!("📐 Overlay frame: {}x{} at ({}, {})", w, h, x, y);
+
+    egui::ViewportBuilder::default()
+        .with_app_id("bo-ring-overlay")
+        .with_position([x, y])
+        .with_inner_size([w, h])
+        .with_decorations(false)
+        .with_resizable(false)
+        .with_always_on_top()
+        .with_transparent(true)
+        .with_taskbar(false)
+}
+
+/// PID of the app that was frontmost when the ring was summoned (daemon side),
+/// so the chosen shortcut can be delivered back to it.
+static LAST_TARGET_PID: AtomicI32 = AtomicI32::new(0);
+
+pub fn set_last_target_pid(pid: i32) {
+    LAST_TARGET_PID.store(pid, Ordering::SeqCst);
+}
+
+pub fn last_target_pid() -> i32 {
+    LAST_TARGET_PID.load(Ordering::SeqCst)
+}
+
+/// Executable path of a pid (libproc).
+pub fn pid_path(pid: i32) -> Option<String> {
+    if pid <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    String::from_utf8(buf).ok()
+}
+
+pub fn is_pid_alive(pid: i32) -> bool {
+    pid > 0 && unsafe { libc::kill(pid, 0) } == 0
+}
+
+/// Guards against PID reuse: the process must be alive AND be a bo-ring binary.
+pub fn is_pid_boring(pid: i32) -> bool {
+    is_pid_alive(pid) && pid_path(pid).is_some_and(|p| p.contains("bo-ring"))
 }
 
 pub fn cleanup_stale_ring_pid() {
     let pid_path = ring_pid_file_path();
-    if pid_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&pid_path) {
-            if let Ok(pid) = content.trim().parse::<i32>() {
-                if !is_pid_boring(pid) {
-                    println!("🧹 Cleaning stale Ring Menu PID file (PID {} dead/reused)...", pid);
-                    let _ = std::fs::remove_file(&pid_path);
-                }
-            } else {
+    if let Ok(content) = std::fs::read_to_string(&pid_path) {
+        match content.trim().parse::<i32>() {
+            Ok(pid) if is_pid_boring(pid) => {}
+            Ok(pid) => {
+                println!("🧹 Cleaning stale Ring Menu PID file (PID {} dead/reused)...", pid);
                 let _ = std::fs::remove_file(&pid_path);
             }
-        } else {
-            let _ = std::fs::remove_file(&pid_path);
+            Err(_) => {
+                let _ = std::fs::remove_file(&pid_path);
+            }
         }
     }
 }
 
-pub fn build_ring_overlay_viewport() -> egui::ViewportBuilder {
-    let (work_w, work_h) = get_work_area_size().unwrap_or((2560.0, 1440.0));
-    println!("📐 Work area size: {}x{}", work_w, work_h);
-
-    egui::ViewportBuilder::default()
-        .with_app_id("bo-ring-overlay")
-        .with_maximized(true)
-        .with_inner_size([work_w, work_h])
-        .with_decorations(false)
-        .with_always_on_top()
-        .with_transparent(true)
-}
-
-/// Safely sends a POSIX signal to a specific process ID.
-///
-/// Invariants enforced:
-/// - `pid > 0` : Strictly positive PID check prevents POSIX broadcast behaviors:
-///   - `pid == 0` would target the caller's entire process group.
-///   - `pid == -1` would broadcast to all processes the user has permission to signal.
-///
-/// Returns `true` if the signal was successfully delivered, `false` otherwise.
+/// Safely sends a POSIX signal to a specific process ID (`pid > 0` only —
+/// 0 / -1 would target a process group or every process).
 pub fn safe_kill(pid: i32, sig: i32) -> bool {
     if pid <= 0 {
         return false;
     }
-    // Safety: pid is strictly positive (> 0), targeting only a specific process.
-    let ret = unsafe { libc::kill(pid, sig) };
-    ret == 0
+    unsafe { libc::kill(pid, sig) == 0 }
 }
 
-/// Safely terminates an active Bo-Ring overlay process after validating its identity.
-///
-/// Guarantees:
-/// 1. `pid > 0` (via `safe_kill`).
-/// 2. `/proc/{pid}/cmdline` contains "bo-ring" to protect against OS PID recycling.
-/// 3. Sends `SIGTERM` and returns whether delivery succeeded.
+/// Terminates an active Bo-Ring overlay process after validating its identity.
 pub fn terminate_ring_process(pid: i32) -> bool {
     if !is_pid_boring(pid) {
         return false;
@@ -341,21 +172,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_get_work_area_size() {
-        let size = get_work_area_size();
-        println!("Detected work area size: {:?}", size);
-        if let Some((w, h)) = size {
-            assert!(w > 0.0);
-            assert!(h > 0.0);
-        }
-    }
-
-    #[test]
     fn test_safe_kill_invalid_pid() {
         assert!(!safe_kill(0, libc::SIGTERM));
         assert!(!safe_kill(-1, libc::SIGTERM));
         assert!(!safe_kill(-100, libc::SIGTERM));
         assert!(!terminate_ring_process(0));
         assert!(!terminate_ring_process(-1));
+    }
+
+    #[test]
+    fn test_pid_identity() {
+        let me = std::process::id() as i32;
+        assert!(is_pid_alive(me));
+        assert!(pid_path(me).is_some());
+        assert!(!is_pid_alive(0));
     }
 }

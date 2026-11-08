@@ -9,7 +9,6 @@ pub use model::*;
 pub use registry::*;
 
 use eframe::egui;
-use evdev::enumerate;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -46,293 +45,121 @@ pub struct MouseInputEvent {
 
 static LAST_KNOWN_BATTERY_LEVEL: AtomicU8 = AtomicU8::new(60);
 
+/// macOS: is a Logitech mouse attached over a USB cable (not a receiver)?
 pub fn check_usb_direct_mouse_cable_connected() -> bool {
-    if let Ok(entries) = std::fs::read_dir("/sys/bus/usb/devices") {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let vendor_path = path.join("idVendor");
-            let product_path = path.join("product");
-            if vendor_path.exists() {
-                if let Ok(vendor) = std::fs::read_to_string(&vendor_path) {
-                    if vendor.trim().to_lowercase() == "046d" {
-                        let product = std::fs::read_to_string(&product_path)
-                            .unwrap_or_default()
-                            .to_lowercase();
-                        if (product.contains("mouse") || product.contains("mx master"))
-                            && !product.contains("receiver")
-                            && !product.contains("keyboard")
-                        {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    false
+    enumerate_hid_mice().iter().any(|m| m.bus == "usb" && !m.name.to_lowercase().contains("receiver") && m.vendor == 0x046d)
 }
 
+/// Battery via HID++ (UNIFIED_BATTERY 0x1004 / BATTERY_STATUS 0x1000).
 pub fn query_hidpp_battery_status() -> Option<(u8, bool)> {
-    // Queries HID++ battery on /dev/hidraw*
-    let mut hidpp_level = None;
-    let mut hidpp_charging = false;
-
-    if let Ok(entries) = std::fs::read_dir("/dev") {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("hidraw") {
-                let dev_path = entry.path();
-
-                // 1. Verify via sysfs that this hidraw node belongs to a Logitech device (046d) and is not a keyboard
-                let uevent_path = std::path::PathBuf::from("/sys/class/hidraw").join(&name).join("device/uevent");
-                if let Ok(uevent) = std::fs::read_to_string(&uevent_path) {
-                    let uevent_low = uevent.to_lowercase();
-                    if !uevent_low.contains("v0000046d") || uevent_low.contains("keyboard") {
-                        continue;
-                    }
-                }
-
-                // 2. Open with O_NONBLOCK (2048) so read never blocks the thread
-                use std::os::unix::fs::OpenOptionsExt;
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .custom_flags(2048) // libc::O_NONBLOCK
-                    .open(&dev_path)
-                {
-                    use std::io::{Read, Write};
-
-                    // Short HID++ 1.0/2.0 battery query report
-                    let mut req = [0u8; 7];
-                    req[0] = 0x10; // Report ID (Short report)
-                    req[1] = 0xff; // Device Index (0xFF = Receiver / default)
-                    req[2] = 0x0d; // Battery Feature ID / SubID
-                    req[3] = 0x00;
-
-                    if file.write_all(&req).is_ok() {
-                        std::thread::sleep(std::time::Duration::from_millis(15));
-                        let mut resp = [0u8; 20];
-                        if let Ok(read_res) = file.read(&mut resp) {
-                            if read_res >= 5 && resp[0] == 0x10 {
-                                let level = resp[4];
-                                if level > 0 && level <= 100 {
-                                    hidpp_level = Some(level);
-                                    let status_byte = resp[5];
-                                    if status_byte == 1 || status_byte == 3 || status_byte == 4 {
-                                        hidpp_charging = true;
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-
-    if let Some(level) = hidpp_level {
-        Some((level, hidpp_charging))
-    } else {
-        None
-    }
+    hidpp::query_battery()
 }
 
 pub fn scan_battery_level() -> (u8, bool) {
-    let mut detected_capacity = None;
-    let mut detected_charging = false;
-
-    // 1. Try sysfs detection /sys/class/power_supply (e.g. Bluetooth)
-    if let Ok(entries) = std::fs::read_dir("/sys/class/power_supply") {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name_lower = entry.file_name().to_string_lossy().to_lowercase();
-            if name_lower.contains("keyboard") {
-                continue;
-            }
-
-            let cap_path = path.join("capacity");
-            if cap_path.exists() {
-                if let Ok(cap_str) = std::fs::read_to_string(&cap_path) {
-                    if let Ok(val) = cap_str.trim().parse::<u8>() {
-                        if detected_capacity.is_none() {
-                            detected_capacity = Some(val);
-                            LAST_KNOWN_BATTERY_LEVEL.store(val, Ordering::Relaxed);
-                        }
-                    }
-                }
-            }
-
-            let status_path = path.join("status");
-            if status_path.exists() {
-                if let Ok(s) = std::fs::read_to_string(&status_path) {
-                    let s_low = s.trim().to_lowercase();
-                    if s_low == "charging" || s_low == "full" {
-                        detected_charging = true;
-                    }
-                }
-            }
-        }
+    if let Some((level, charging)) = query_hidpp_battery_status() {
+        LAST_KNOWN_BATTERY_LEVEL.store(level, Ordering::Relaxed);
+        return (level, charging || check_usb_direct_mouse_cable_connected());
     }
+    (LAST_KNOWN_BATTERY_LEVEL.load(Ordering::Relaxed), check_usb_direct_mouse_cable_connected())
+}
 
-    // 2. If sysfs did not detect charge (USB Receiver), query HID++ on /dev/hidraw*
-    if detected_capacity.is_none() || !detected_charging {
-        if let Some((hidpp_level, hidpp_charging)) = query_hidpp_battery_status() {
-            if detected_capacity.is_none() {
-                detected_capacity = Some(hidpp_level);
-                LAST_KNOWN_BATTERY_LEVEL.store(hidpp_level, Ordering::Relaxed);
-            }
-            if hidpp_charging {
-                detected_charging = true;
-            }
+#[derive(Clone, Debug)]
+pub struct HidMouse {
+    pub path: PathBuf,
+    pub name: String,
+    pub vendor: u16,
+    pub product: u16,
+    /// "bluetooth" | "usb" | "other"
+    pub bus: &'static str,
+}
+
+/// Pointer devices (HID usage page 1 / usage 2) known to IOKit.
+pub fn enumerate_hid_mice() -> Vec<HidMouse> {
+    let Ok(api) = hidapi_snapshot() else { return Vec::new() };
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for d in api {
+        if d.0 != 0x0001 || d.1 != 0x0002 {
+            continue;
         }
+        if !seen.insert(d.2.clone()) {
+            continue;
+        }
+        out.push(HidMouse { path: PathBuf::from(&d.2), name: d.3, vendor: d.4, product: d.5, bus: d.6 });
     }
+    out
+}
 
-    let is_usb_cable = check_usb_direct_mouse_cable_connected();
-    let is_charging = detected_charging || is_usb_cable;
-    let final_battery = detected_capacity.unwrap_or_else(|| LAST_KNOWN_BATTERY_LEVEL.load(Ordering::Relaxed));
-
-    (final_battery, is_charging)
+/// (usage_page, usage, path, product, vid, pid, bus) for every HID interface.
+fn hidapi_snapshot() -> Result<Vec<(u16, u16, String, String, u16, u16, &'static str)>, ()> {
+    let api = hidapi::HidApi::new().map_err(|_| ())?;
+    Ok(api
+        .device_list()
+        .map(|d| {
+            let bus = match d.bus_type() {
+                hidapi::BusType::Bluetooth => "bluetooth",
+                hidapi::BusType::Usb => "usb",
+                _ => "other",
+            };
+            (
+                d.usage_page(),
+                d.usage(),
+                d.path().to_string_lossy().to_string(),
+                d.product_string().unwrap_or("Unknown device").to_string(),
+                d.vendor_id(),
+                d.product_id(),
+                bus,
+            )
+        })
+        .collect())
 }
 
 pub fn enumerate_input_device_names() -> Vec<(PathBuf, String, Option<String>, bool)> {
-    let mut devices = Vec::new();
-
-    // 1. Try sysfs /sys/class/input/event*/device/name (immune to EBUSY / EVIOCGRAB locks from background daemon)
-    if let Ok(entries) = std::fs::read_dir("/sys/class/input") {
-        for entry in entries.flatten() {
-            let file_name = entry.file_name().to_string_lossy().to_string();
-            if file_name.starts_with("event") {
-                let name_path = entry.path().join("device/name");
-                if let Ok(name) = std::fs::read_to_string(&name_path) {
-                    let dev_path = PathBuf::from("/dev/input").join(&file_name);
-                    let vendor_path = entry.path().join("device/id/vendor");
-                    let product_path = entry.path().join("device/id/product");
-                    let vid_pid = if let (Ok(v), Ok(p)) = (std::fs::read_to_string(&vendor_path), std::fs::read_to_string(&product_path)) {
-                        let v_str = v.trim().to_lowercase();
-                        let p_str = p.trim().to_lowercase();
-                        if !v_str.is_empty() && !p_str.is_empty() {
-                            Some(format!("{}:{}", v_str, p_str))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    // Detect mouse via evdev capabilities when possible
-                    let is_mouse = if let Ok(device) = evdev::Device::open(&dev_path) {
-                        let has_btn_left = device.supported_keys()
-                            .map_or(false, |keys| keys.contains(evdev::Key::BTN_LEFT));
-                        let has_letter_keys = device.supported_keys()
-                            .map_or(false, |keys| keys.contains(evdev::Key::KEY_A));
-                        has_btn_left && !has_letter_keys
-                    } else {
-                        // Device busy (grabbed by daemon) — fallback to name heuristic
-                        let name_lower = name.trim().to_lowercase();
-                        !name_lower.contains("keyboard")
-                            && (name_lower.contains("mouse")
-                                || name_lower.contains("pointer")
-                                || name_lower.contains("touchpad"))
-                    };
-
-                    devices.push((dev_path, name.trim().to_string(), vid_pid, is_mouse));
-                }
-            }
-        }
-    }
-
-    // 2. Fallback to evdev::enumerate() if sysfs was empty
-    if devices.is_empty() {
-        for (path, device) in enumerate() {
-            let name = device.name().unwrap_or("Unknown device").to_string();
-            let input_id = device.input_id();
-            let vid_pid = Some(format!("{:04x}:{:04x}", input_id.vendor(), input_id.product()));
-            let has_btn_left = device.supported_keys()
-                .map_or(false, |keys| keys.contains(evdev::Key::BTN_LEFT));
-            let has_letter_keys = device.supported_keys()
-                .map_or(false, |keys| keys.contains(evdev::Key::KEY_A));
-            let is_mouse = has_btn_left && !has_letter_keys;
-            devices.push((path, name, vid_pid, is_mouse));
-        }
-    }
-
-    devices
+    enumerate_hid_mice()
+        .into_iter()
+        .map(|m| {
+            let vp = Some(format!("{:04x}:{:04x}", m.vendor, m.product));
+            (m.path, m.name, vp, true)
+        })
+        .collect()
 }
 
 pub fn scan_mouse_device() -> Option<MouseDeviceInfo> {
-    let mut found_name = String::new();
-    let mut found_vid_pid: Option<String> = None;
-    let mut has_bluetooth_mouse = false;
-    let mut has_receiver_mouse = false;
-    let mut count = 0;
-
-    let devices = enumerate_input_device_names();
-
-    for (_path, name, vid_pid, is_mouse) in devices {
-        let name_lower = name.to_lowercase();
-
-        // Skip our own virtual device and keyboards
-        if name_lower.contains("keyboard") || name_lower.contains("bo-ring virtual") {
-            continue;
-        }
-
-        // Use capability-based detection instead of brand-specific name matching
-        if !is_mouse {
-            continue;
-        }
-
-        count += 1;
-
-        // Determine connection type from device name hints
-        if name_lower.contains("receiver") || name_lower.contains("bolt") || name_lower.contains("unifying") || name_lower.contains("dongle") {
-            has_receiver_mouse = true;
-        } else if name_lower.contains("bluetooth") || name_lower.contains(" bt") {
-            has_bluetooth_mouse = true;
-        } else {
-            // Default assumption for non-receiver devices
-            has_bluetooth_mouse = true;
-        }
-
-        // Keep the most specific name found (prefer non-generic names)
-        if found_name.is_empty() || (!name_lower.contains("receiver") && !name_lower.contains("dongle")) {
-            found_name = name.clone();
-        }
-        if found_vid_pid.is_none() && vid_pid.is_some() {
-            found_vid_pid = vid_pid.clone();
-        }
-    }
-
-    if count > 0 {
-        let (battery_level, is_charging) = scan_battery_level();
-        let connection_type = if has_bluetooth_mouse {
-            ConnectionType::Bluetooth
-        } else if check_usb_direct_mouse_cable_connected() {
-            ConnectionType::UsbCable
-        } else if has_receiver_mouse {
-            ConnectionType::UsbReceiver
-        } else {
-            ConnectionType::Bluetooth
-        };
-
-        // Let DeviceRegistry handle profile matching — no hardcoded fallback name
-        let detected_profile_id = DeviceRegistry::new()
-            .match_device(&found_name, found_vid_pid.as_deref())
-            .map(|p| p.config.id.clone());
-
-        Some(MouseDeviceInfo {
-            name: found_name,
-            connection_type,
-            battery_level,
-            is_charging,
-            channel_count: count,
-            detected_profile_id,
-            vid_pid: found_vid_pid,
+    let mice: Vec<HidMouse> = enumerate_hid_mice()
+        .into_iter()
+        .filter(|m| {
+            let n = m.name.to_lowercase();
+            !n.contains("keyboard") && !n.contains("trackpad")
         })
-    } else {
-        None
+        .collect();
+    if mice.is_empty() {
+        return None;
     }
+    // Prefer a Logitech device, then any named mouse.
+    let best = mice.iter().find(|m| m.vendor == 0x046d).unwrap_or(&mice[0]).clone();
+    let vid_pid = Some(format!("{:04x}:{:04x}", best.vendor, best.product));
+    let connection_type = if best.name.to_lowercase().contains("receiver") {
+        ConnectionType::UsbReceiver
+    } else if best.bus == "bluetooth" {
+        ConnectionType::Bluetooth
+    } else if best.bus == "usb" {
+        ConnectionType::UsbCable
+    } else {
+        ConnectionType::Bluetooth
+    };
+    let (battery_level, is_charging) = scan_battery_level();
+    let detected_profile_id = DeviceRegistry::new()
+        .match_device(&best.name, vid_pid.as_deref())
+        .map(|p| p.config.id.clone());
+    Some(MouseDeviceInfo {
+        name: best.name,
+        connection_type,
+        battery_level,
+        is_charging,
+        channel_count: mice.len(),
+        detected_profile_id,
+        vid_pid,
+    })
 }
 
 pub fn attach_new_mouse_listeners(
@@ -344,7 +171,8 @@ pub fn attach_new_mouse_listeners(
     let tx_ipc = tx.clone();
     let ctx_ipc = ctx.clone();
 
-    // 1. Attempt Unix Socket connection to background daemon
+    // 1. Preferred: events relayed by the running daemon over its Unix socket.
+    let daemon_up = std::os::unix::net::UnixStream::connect(&sock_path).is_ok();
     thread::spawn(move || {
         use std::io::{BufRead, BufReader};
         use std::os::unix::net::UnixStream;
@@ -364,13 +192,7 @@ pub fn attach_new_mouse_listeners(
                     };
                     if let (Some(code), Some(raw_code)) = (code_opt, raw_opt) {
                         if is_supported_button_code(raw_code) || is_supported_button_code(code) {
-                            println!("⚡ Event captured via IPC Socket: Button {} (from {:?}, {:?})", code, dev_name, vid_pid);
-                            let _ = tx_ipc.send(MouseInputEvent {
-                                code,
-                                raw_code,
-                                dev_name,
-                                vid_pid,
-                            });
+                            let _ = tx_ipc.send(MouseInputEvent { code, raw_code, dev_name, vid_pid });
                             ctx_ipc.request_repaint();
                         }
                     }
@@ -379,74 +201,37 @@ pub fn attach_new_mouse_listeners(
         }
     });
 
-    // 2. Direct evdev listening (fallback when daemon is not running)
-    let tx_evdev = tx.clone();
-    let ctx_evdev = ctx.clone();
-    thread::spawn(move || {
-        for (path, device) in enumerate() {
-            let name = device.name().unwrap_or("Unknown device");
-            let name_lower = name.to_lowercase();
+    // The daemon already owns the tap and the HID++ diversion: don't compete.
+    if daemon_up {
+        return;
+    }
 
-            // Ignore keyboards
-            if name_lower.contains("keyboard") {
-                continue;
-            }
-
-            if name_lower.contains("logitech") || name_lower.contains("mouse") || name_lower.contains("receiver") || name_lower.contains("mx master") {
-                let mut paths_lock = listened_paths.lock().unwrap();
-                if !paths_lock.contains(&path) {
-                    paths_lock.insert(path.clone());
-                    drop(paths_lock);
-
-                    let tx = tx_evdev.clone();
-                    let ctx = ctx_evdev.clone();
-                    let dev_name = name.to_string();
-                    let dev_path = path.clone();
-                    let listened_paths_worker = Arc::clone(&listened_paths);
-                    let dev_path_worker = path.clone();
-
-                    println!("🔍 Hot-Plug Listener: Attaching receiver to [{:?}] {}", dev_path, dev_name);
-
-                    thread::spawn(move || {
-                        if let Ok(mut device) = evdev::Device::open(&dev_path) {
-                            let input_id = device.input_id();
-                            let dev_vid_pid = format!("{:04x}:{:04x}", input_id.vendor(), input_id.product());
-                            println!("✅ Hot-Plug Listener: Successfully opened {:?} [{}] ({})", dev_path, dev_vid_pid, dev_name);
-                            loop {
-                                if let Ok(events) = device.fetch_events() {
-                                    for ev in events {
-                                        if ev.value() == 1 && ev.event_type().0 != 0 {
-                                            let raw_code = ev.code();
-                                            if is_supported_button_code(raw_code) {
-                                                let code = normalize_button_code(raw_code);
-                                                println!("⚡ Event captured ({}) : Raw code {} -> Normalized {}", dev_name, raw_code, code);
-                                                let _ = tx.send(MouseInputEvent {
-                                                    code,
-                                                    raw_code,
-                                                    dev_name: Some(dev_name.clone()),
-                                                    vid_pid: Some(dev_vid_pid.clone()),
-                                                });
-                                                ctx.request_repaint();
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    println!("🔌 Disconnected/Closed evdev channel {:?}", dev_path);
-                                    break;
-                                }
-                            }
-                        }
-
-                        // Cleanup: free path for future reconnections
-                        let mut lock = listened_paths_worker.lock().unwrap();
-                        lock.remove(&dev_path_worker);
-                    });
+    // 2. Fallback: an observe-only event tap for the standard extra buttons.
+    {
+        let mut lock = listened_paths.lock().unwrap();
+        if lock.insert(PathBuf::from("cgeventtap")) {
+            let (btx, brx) = mpsc::channel::<crate::platform::event_tap::ButtonEvent>();
+            crate::platform::event_tap::start_listen_only_tap(btx);
+            let tx_tap = tx.clone();
+            let ctx_tap = ctx.clone();
+            let name = scan_mouse_device().map(|m| (m.name, m.vid_pid));
+            thread::spawn(move || {
+                for ev in brx {
+                    if ev.value == 1 && is_supported_button_code(ev.code) {
+                        let _ = tx_tap.send(MouseInputEvent {
+                            code: normalize_button_code(ev.code),
+                            raw_code: ev.code,
+                            dev_name: name.as_ref().map(|n| n.0.clone()),
+                            vid_pid: name.as_ref().and_then(|n| n.1.clone()),
+                        });
+                        ctx_tap.request_repaint();
+                    }
                 }
-            }
+            });
         }
-    });
+    }
 
-    // 3. Direct HID++ listening on /dev/hidraw* (detects diverted buttons when daemon is not running)
+    // 3. Fallback: direct HID++ diversion for Logitech special controls.
     let diverted_hidpp_paths = Arc::new(Mutex::new(HashSet::new()));
     hidpp::attach_hidpp_gui_listener(ctx, tx, diverted_hidpp_paths);
 }

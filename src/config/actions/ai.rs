@@ -56,28 +56,28 @@ pub fn ai_actions_for_lang(lang: &str) -> Vec<NamedActionConfig> {
             label: t.chatgpt.to_string(),
             translations: build_translation_map(AI_TRANSLATIONS, |x| x.chatgpt),
             icon: "🤖".to_string(),
-            action: ButtonActionConfig::Command { cmd: "xdg-open https://chatgpt.com".to_string() },
+            action: ButtonActionConfig::Command { cmd: "open https://chatgpt.com".to_string() },
         },
         NamedActionConfig {
             id: "ai_perplexity".to_string(),
             label: t.perplexity.to_string(),
             translations: build_translation_map(AI_TRANSLATIONS, |x| x.perplexity),
             icon: "✳️".to_string(),
-            action: ButtonActionConfig::Command { cmd: "xdg-open https://perplexity.ai".to_string() },
+            action: ButtonActionConfig::Command { cmd: "open https://perplexity.ai".to_string() },
         },
         NamedActionConfig {
             id: "ai_claude".to_string(),
             label: t.claude.to_string(),
             translations: build_translation_map(AI_TRANSLATIONS, |x| x.claude),
             icon: "🟣".to_string(),
-            action: ButtonActionConfig::Command { cmd: "xdg-open https://claude.ai".to_string() },
+            action: ButtonActionConfig::Command { cmd: "open https://claude.ai".to_string() },
         },
         NamedActionConfig {
             id: "ai_deepseek".to_string(),
             label: t.deepseek.to_string(),
             translations: build_translation_map(AI_TRANSLATIONS, |x| x.deepseek),
             icon: "⚡".to_string(),
-            action: ButtonActionConfig::Command { cmd: "xdg-open https://chat.deepseek.com".to_string() },
+            action: ButtonActionConfig::Command { cmd: "open https://chat.deepseek.com".to_string() },
         },
     ]
 }

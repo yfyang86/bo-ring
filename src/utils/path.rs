@@ -35,6 +35,13 @@ pub fn expand_path_arg(arg: &str) -> String {
     }
 }
 
+/// `Bo-Ring.app/Contents/Resources` when running from an app bundle.
+pub fn bundle_resources_dir() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    let res = exe.parent()?.parent()?.join("Resources");
+    (exe.parent()?.ends_with("Contents/MacOS") && res.is_dir()).then_some(res)
+}
+
 /// Resolves an asset / icon path checking standard user and system asset directories.
 pub fn resolve_asset_path(path_str: &str) -> PathBuf {
     let expanded = expand_home_path(path_str);
@@ -58,6 +65,13 @@ pub fn resolve_asset_path(path_str: &str) -> PathBuf {
             return user_config;
         }
 
+    }
+
+    if let Some(res) = bundle_resources_dir() {
+        let bundled = res.join(trimmed);
+        if bundled.is_file() {
+            return bundled;
+        }
     }
 
     let sys_local_share = PathBuf::from("/usr/local/share/bo-ring").join(trimmed);

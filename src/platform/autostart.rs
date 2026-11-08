@@ -1,7 +1,19 @@
+//! Autostart integration for macOS (launchd), keeping the Linux function names
+//! so the Settings tab is unchanged:
+//!
+//! | Linux name            | macOS meaning                                              |
+//! |-----------------------|------------------------------------------------------------|
+//! | `*_systemd_*`         | LaunchAgent `dev.bo-ring.daemon` running `bo-ring --daemon` (KeepAlive) |
+//! | `*_xdg_autostart*`    | LaunchAgent `dev.bo-ring.config` opening the config UI at login |
+//! | `*_gnome_menu*`       | `~/Applications/Bo-Ring.app` launcher (Spotlight / Launchpad) |
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+
+pub const DAEMON_LABEL: &str = "dev.bo-ring.daemon";
+pub const CONFIG_LABEL: &str = "dev.bo-ring.config";
 
 pub fn get_exe_path() -> PathBuf {
     env::current_exe().unwrap_or_else(|_| PathBuf::from("bo-ring"))
@@ -11,129 +23,139 @@ pub fn get_home_dir() -> PathBuf {
     env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/tmp"))
 }
 
+fn launch_agents_dir() -> PathBuf {
+    get_home_dir().join("Library/LaunchAgents")
+}
+
+fn uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+fn domain() -> String {
+    format!("gui/{}", uid())
+}
+
+pub fn log_dir() -> PathBuf {
+    get_home_dir().join("Library/Logs/bo-ring")
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn agent_plist(label: &str, args: &[&str], keep_alive: bool, log_name: &str) -> String {
+    let exe = get_exe_path().to_string_lossy().to_string();
+    let mut argv = format!("        <string>{}</string>\n", xml_escape(&exe));
+    for a in args {
+        argv.push_str(&format!("        <string>{}</string>\n", xml_escape(a)));
+    }
+    let logs = log_dir();
+    let _ = fs::create_dir_all(&logs);
+    let log = xml_escape(&logs.join(log_name).to_string_lossy());
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+{argv}    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><{ka}/>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>LimitLoadToSessionType</key><string>Aqua</string>
+    <key>StandardOutPath</key><string>{log}</string>
+    <key>StandardErrorPath</key><string>{log}</string>
+</dict>
+</plist>
+"#,
+        ka = if keep_alive { "true" } else { "false" }
+    )
+}
+
+fn launchctl(args: &[&str]) -> Result<String, String> {
+    let out = Command::new("launchctl").args(args).output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+fn is_loaded(label: &str) -> bool {
+    launchctl(&["print", &format!("{}/{}", domain(), label)]).is_ok()
+}
+
+fn is_running(label: &str) -> bool {
+    launchctl(&["print", &format!("{}/{}", domain(), label)])
+        .map(|s| s.contains("state = running"))
+        .unwrap_or(false)
+}
+
+fn install_agent(label: &str, args: &[&str], keep_alive: bool, log_name: &str) -> Result<(), String> {
+    let dir = launch_agents_dir();
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("{label}.plist"));
+    fs::write(&path, agent_plist(label, args, keep_alive, log_name)).map_err(|e| e.to_string())?;
+    let _ = launchctl(&["bootout", &format!("{}/{}", domain(), label)]);
+    launchctl(&["bootstrap", &domain(), &path.to_string_lossy()])?;
+    let _ = launchctl(&["enable", &format!("{}/{}", domain(), label)]);
+    Ok(())
+}
+
+fn remove_agent(label: &str) -> Result<(), String> {
+    let _ = launchctl(&["bootout", &format!("{}/{}", domain(), label)]);
+    let path = launch_agents_dir().join(format!("{label}.plist"));
+    if path.exists() {
+        fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 // ==========================================
-// 1. User Systemd Service
+// 1. Background daemon (LaunchAgent)
 // ==========================================
 
 pub fn systemd_service_path() -> PathBuf {
-    get_home_dir().join(".config/systemd/user/bo-ring.service")
-}
-
-pub fn systemd_system_unit_path() -> PathBuf {
-    PathBuf::from("/usr/lib/systemd/user/bo-ring.service")
+    launch_agents_dir().join(format!("{DAEMON_LABEL}.plist"))
 }
 
 pub fn is_systemd_installed() -> bool {
-    systemd_service_path().exists() || systemd_system_unit_path().exists()
+    systemd_service_path().exists()
 }
 
 pub fn is_systemd_enabled() -> bool {
-    let output = Command::new("systemctl")
-        .args(["--user", "is-enabled", "bo-ring.service"])
-        .output();
-
-    if let Ok(out) = output {
-        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        return stdout == "enabled";
-    }
-    false
+    is_systemd_installed() && is_loaded(DAEMON_LABEL)
 }
 
 pub fn is_systemd_active() -> bool {
-    let output = Command::new("systemctl")
-        .args(["--user", "is-active", "bo-ring.service"])
-        .output();
-
-    if let Ok(out) = output {
-        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if stdout == "active" {
-            return true;
-        }
-    }
-    false
+    is_running(DAEMON_LABEL)
 }
 
 pub fn enable_systemd_service() -> Result<(), String> {
-    let user_path = systemd_service_path();
-    let sys_path = systemd_system_unit_path();
-
-    // If no system unit exists, create user unit in ~/.config/systemd/user/
-    if !sys_path.exists() {
-        let exe = get_exe_path();
-        let service_dir = get_home_dir().join(".config/systemd/user");
-        fs::create_dir_all(&service_dir).map_err(|e| format!("Failed to create systemd directory: {}", e))?;
-
-        let service_content = format!(
-            "[Unit]\n\
-             Description=Bo-Ring Daemon\n\
-             After=graphical-session.target\n\
-             StartLimitIntervalSec=0\n\n\
-             [Service]\n\
-             ExecStart={} --daemon\n\
-             Restart=on-failure\n\
-             RestartSec=3\n\n\
-             [Install]\n\
-             WantedBy=graphical-session.target\n",
-            exe.to_string_lossy()
-        );
-
-        fs::write(&user_path, service_content).map_err(|e| format!("Failed to write service file: {}", e))?;
-    }
-
-    // Reload and enable systemd user service
-    let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).output();
-    let res = Command::new("systemctl").args(["--user", "enable", "--now", "bo-ring.service"]).output();
-
-    match res {
-        Ok(out) if out.status.success() => Ok(()),
-        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
-        Err(e) => Err(e.to_string()),
-    }
+    install_agent(DAEMON_LABEL, &["--daemon"], true, "daemon.log")
 }
 
 pub fn disable_systemd_service() -> Result<(), String> {
-    let res = Command::new("systemctl").args(["--user", "disable", "--now", "bo-ring.service"]).output();
-    let user_path = systemd_service_path();
-    if user_path.exists() && systemd_system_unit_path().exists() {
-        let _ = fs::remove_file(user_path);
-    }
-    let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).output();
-
-    match res {
-        Ok(out) if out.status.success() => Ok(()),
-        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
-        Err(e) => Err(e.to_string()),
-    }
+    remove_agent(DAEMON_LABEL)
 }
 
 pub fn restart_systemd_service_if_active() {
     if is_systemd_active() {
-        println!("🔄 Restarting bo-ring daemon service to apply new configuration...");
-        let _ = Command::new("systemctl").args(["--user", "restart", "bo-ring.service"]).output();
+        let _ = launchctl(&["kickstart", "-k", &format!("{}/{}", domain(), DAEMON_LABEL)]);
     }
 }
 
-pub fn ensure_gnome_show_desktop_keybinding() {
-    let output = Command::new("gsettings")
-        .args(["get", "org.gnome.desktop.wm.keybindings", "show-desktop"])
-        .output();
-    if let Ok(out) = output {
-        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if stdout == "@as []" || stdout == "[]" {
-            println!("⚙️ Enabling GNOME show-desktop keybinding ('<Super>d', '<Control><Alt>d')...");
-            let _ = Command::new("gsettings")
-                .args(["set", "org.gnome.desktop.wm.keybindings", "show-desktop", "['<Super>d', '<Control><Alt>d']"])
-                .output();
-        }
-    }
-}
+/// GNOME-only on Linux; nothing to do on macOS.
+pub fn ensure_gnome_show_desktop_keybinding() {}
 
 // ==========================================
-// 2. XDG Autostart Desktop File
+// 2. Open the configurator at login
 // ==========================================
 
 pub fn xdg_autostart_path() -> PathBuf {
-    get_home_dir().join(".config/autostart/bo-ring.desktop")
+    launch_agents_dir().join(format!("{CONFIG_LABEL}.plist"))
 }
 
 pub fn is_xdg_autostart_installed() -> bool {
@@ -141,97 +163,84 @@ pub fn is_xdg_autostart_installed() -> bool {
 }
 
 pub fn enable_xdg_autostart() -> Result<(), String> {
-    let exe = get_exe_path();
-    let autostart_dir = get_home_dir().join(".config/autostart");
-    fs::create_dir_all(&autostart_dir).map_err(|e| format!("Failed to create autostart directory: {}", e))?;
-
-    let desktop_content = format!(
-        "[Desktop Entry]\n\
-         Type=Application\n\
-         Name=Bo-Ring Daemon\n\
-         Comment=Bo-Ring background daemon\n\
-         Exec={} --daemon\n\
-         Icon=input-mouse\n\
-         Terminal=false\n\
-         Categories=Utility;Settings;\n\
-         X-GNOME-Autostart-enabled=true\n",
-        exe.to_string_lossy()
-    );
-
-    let path = xdg_autostart_path();
-    fs::write(path, desktop_content).map_err(|e| format!("Failed to write .desktop autostart file: {}", e))?;
-    Ok(())
+    // Write the plist only (no bootstrap) so it takes effect at next login
+    // instead of opening the window right now.
+    let dir = launch_agents_dir();
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    fs::write(xdg_autostart_path(), agent_plist(CONFIG_LABEL, &[], false, "config.log")).map_err(|e| e.to_string())
 }
 
 pub fn disable_xdg_autostart() -> Result<(), String> {
-    let path = xdg_autostart_path();
-    if path.exists() {
-        fs::remove_file(path).map_err(|e| format!("Failed to delete autostart file: {}", e))?;
-    }
-    Ok(())
+    remove_agent(CONFIG_LABEL)
 }
 
 // ==========================================
-// 3. GNOME Application Menu Shortcut
+// 3. Applications-folder launcher
 // ==========================================
 
 pub fn gnome_menu_path() -> PathBuf {
-    get_home_dir().join(".local/share/applications/bo-ring.desktop")
+    get_home_dir().join("Applications/Bo-Ring.app")
 }
 
 pub fn gnome_system_menu_path() -> PathBuf {
-    PathBuf::from("/usr/share/applications/bo-ring.desktop")
+    PathBuf::from("/Applications/Bo-Ring.app")
 }
-
 
 pub fn is_gnome_menu_system() -> bool {
     gnome_system_menu_path().exists()
 }
 
+/// Create a minimal `Bo-Ring.app` that launches this binary's config UI.
 pub fn install_gnome_menu() -> Result<(), String> {
-    let exe = get_exe_path();
-    let apps_dir = get_home_dir().join(".local/share/applications");
-    fs::create_dir_all(&apps_dir).map_err(|e| format!("Failed to create applications directory: {}", e))?;
-
-    let desktop_content = format!(
-        "[Desktop Entry]\n\
-         Type=Application\n\
-         Name=Bo-Ring\n\
-         Comment=Bo-Ring GUI Configurator and Action Ring\n\
-         Exec={}\n\
-         Icon=input-mouse\n\
-         StartupWMClass=bo-ring\n\
-         Terminal=false\n\
-         Categories=Settings;HardwareSettings;Utility;\n",
-        exe.to_string_lossy()
-    );
-
-    let path = gnome_menu_path();
-    fs::write(path, desktop_content).map_err(|e| format!("Failed to write GNOME shortcut: {}", e))?;
-
-    // Update desktop database
-    let _ = Command::new("update-desktop-database")
-        .arg(apps_dir.to_string_lossy().to_string())
-        .output();
-
+    let app = gnome_menu_path();
+    let macos = app.join("Contents/MacOS");
+    fs::create_dir_all(&macos).map_err(|e| e.to_string())?;
+    let exe = get_exe_path().to_string_lossy().replace('\'', "'\\''");
+    let script = format!("#!/bin/sh\nexec '{exe}' \"$@\"\n");
+    let launcher = macos.join("bo-ring-launcher");
+    fs::write(&launcher, script).map_err(|e| e.to_string())?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>Bo-Ring</string>
+    <key>CFBundleIdentifier</key><string>dev.bo-ring.launcher</string>
+    <key>CFBundleExecutable</key><string>bo-ring-launcher</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.2.0</string>
+    <key>LSMinimumSystemVersion</key><string>11.0</string>
+</dict>
+</plist>
+"#;
+    fs::write(app.join("Contents/Info.plist"), plist).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 pub fn remove_gnome_menu() -> Result<(), String> {
-    let path = gnome_menu_path();
-    if path.exists() {
-        fs::remove_file(path).map_err(|e| format!("Failed to delete GNOME shortcut: {}", e))?;
+    let app = gnome_menu_path();
+    if app.exists() {
+        fs::remove_dir_all(&app).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
-// ==========================================
-// 4. Check Permissions / uinput
-// ==========================================
-
+/// Linux checked /dev/uinput; on macOS synthesizing keys needs Accessibility.
 pub fn check_uinput_access() -> bool {
-    fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/uinput")
-        .is_ok()
+    super::permissions::accessibility_granted()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_agent_plist_contents() {
+        let p = agent_plist(DAEMON_LABEL, &["--daemon"], true, "daemon.log");
+        assert!(p.contains("<string>dev.bo-ring.daemon</string>"));
+        assert!(p.contains("<string>--daemon</string>"));
+        assert!(p.contains("<key>KeepAlive</key><true/>"));
+        assert!(p.contains("daemon.log"));
+    }
 }

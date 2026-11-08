@@ -3,6 +3,7 @@
   "name": "Logitech MX Master 4",
   "author": "BazinFla",
   "match_ids": [
+    "046d:b042",
     "046d:c548"
   ],
   "match_names": [
@@ -60,7 +61,8 @@
         0.298,
         0.7
       ],
-      "badge_y_ratio": 0.7
+      "badge_y_ratio": 0.7,
+      "cid": "0x01A0"
     },
     {
       "code": 274,

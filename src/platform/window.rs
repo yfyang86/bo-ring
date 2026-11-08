@@ -1,152 +1,111 @@
-use std::process::Command;
-pub use super::gnome::{
-    check_gnome_extension_status, check_gnome_extension_status_lang,
-    install_or_update_gnome_extension, install_or_update_gnome_extension_lang,
-};
+//! Active application detection on macOS — replaces the GNOME / KDE /
+//! Hyprland / Sway / X11 strategies with `NSWorkspace.frontmostApplication`.
+//!
+//! The detected id is the app's **bundle identifier** (e.g.
+//! `org.mozilla.firefox`, `com.microsoft.VSCode`). `matches_app_id` compares
+//! the last dot component case-insensitively, so presets like `firefox` and
+//! `vscode` keep matching; macOS-specific ids are added to the presets.
 
-/// Main entry point for detecting the currently active application/window across Linux compositors.
-/// Delegates detection to isolated desktop platform submodules (gnome, kde, hyprland, sway, x11).
+use objc2_app_kit::{NSRunningApplication, NSWorkspace};
+use objc2_foundation::NSString;
+
+/// Bundle id (falls back to the localized name) of the frontmost application.
 pub fn detect_active_window() -> String {
-    // 1. GNOME Shell DBus Extension (Primary strategy for GNOME 40+)
-    if let Some(app) = detect_gnome_window() {
-        return app;
-    }
-
-    // 2. KDE Plasma kdotool / xprop (Isolated strategy for KDE 5/6)
-    if let Some(app) = detect_kde_window() {
-        return app;
-    }
-
-    // 3. Hyprland (Wayland IPC)
-    if let Some(app) = detect_hyprland_window() {
-        return app;
-    }
-
-    // 4. Sway / wlroots (Wayland IPC)
-    if let Some(app) = detect_sway_window() {
-        return app;
-    }
-
-    // 5. Generic X11 / XWayland (xprop fallback)
-    if let Some(app) = detect_x11_window() {
-        return app;
-    }
-
-    "Global / Desktop".to_string()
+    frontmost_app()
+        .map(|(bundle, name, _)| if bundle.is_empty() { name } else { bundle })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Global / Desktop".to_string())
 }
 
+/// (bundle id, localized name, pid) of the frontmost application.
+pub fn frontmost_app() -> Option<(String, String, i32)> {
+    unsafe {
+        let ws = NSWorkspace::sharedWorkspace();
+        let app = ws.frontmostApplication()?;
+        Some(describe(&app))
+    }
+}
+
+fn describe(app: &NSRunningApplication) -> (String, String, i32) {
+    unsafe {
+        let bundle = app.bundleIdentifier().map(|s| s.to_string()).unwrap_or_default();
+        let name = app.localizedName().map(|s| s.to_string()).unwrap_or_default();
+        (bundle, name, app.processIdentifier())
+    }
+}
+
+/// Human-readable name for a bundle id ("org.mozilla.firefox" → "Firefox").
+pub fn display_name_for(app_id: &str) -> Option<String> {
+    if !app_id.contains('.') {
+        return None;
+    }
+    unsafe {
+        let apps = NSRunningApplication::runningApplicationsWithBundleIdentifier(&NSString::from_str(app_id));
+        if let Some(app) = apps.firstObject() {
+            return app.localizedName().map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+/// Re-activate the application with this pid (restores the user's target app
+/// after the ring overlay — a separate process — took focus).
+pub fn activate_pid(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    unsafe {
+        match NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
+            Some(app) => {
+                #[allow(deprecated)]
+                app.activateWithOptions(objc2_app_kit::NSApplicationActivationOptions::NSApplicationActivateIgnoringOtherApps)
+            }
+            None => false,
+        }
+    }
+}
+
+/// On Linux/GNOME this focused the window under the cursor through a shell
+/// extension. On macOS the daemon restores the previously frontmost app.
 pub fn focus_window_under_cursor() -> bool {
-    if super::gnome::focus_gnome_window_under_cursor() {
-        return true;
-    }
-    false
+    let pid = super::overlay::last_target_pid();
+    activate_pid(pid)
 }
 
-/// Strategy 1: GNOME Shell Extension DBus (Delegated to gnome.rs)
-pub fn detect_gnome_window() -> Option<String> {
-    super::gnome::detect_gnome_window()
-}
-
-/// Strategy 2: KDE Plasma kdotool & xprop (Delegated to kde.rs)
-pub fn detect_kde_window() -> Option<String> {
-    super::kde::detect_kde_window()
-}
-
-/// Strategy 3: Hyprland IPC (Delegated to hyprland.rs)
-pub fn detect_hyprland_window() -> Option<String> {
-    super::hyprland::detect_hyprland_window()
-}
-
-/// Strategy 4: Sway IPC (Delegated to sway.rs)
-pub fn detect_sway_window() -> Option<String> {
-    super::sway::detect_sway_window()
-}
-
-/// Strategy 5: Generic X11 xprop (Delegated to x11.rs)
-pub fn detect_x11_window() -> Option<String> {
-    super::x11::detect_x11_window()
-}
-
-/// Runs diagnostic checks for ALL detection strategies and formats a detailed report.
+/// Diagnostics shown in the Debug tab.
 pub fn run_window_detection_diagnostics() -> String {
     let mut log = String::new();
-    log.push_str("🔍 --- COMPLETE WINDOW DETECTION DIAGNOSTICS ---\n\n");
-
-    log.push_str(&format!("• XDG_CURRENT_DESKTOP: {}\n", std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "undefined".into())));
-    log.push_str(&format!("• XDG_SESSION_TYPE: {}\n", std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "undefined".into())));
-    log.push_str(&format!("• WAYLAND_DISPLAY: {}\n", std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "undefined".into())));
-    log.push_str(&format!("• DISPLAY: {}\n\n", std::env::var("DISPLAY").unwrap_or_else(|_| "undefined".into())));
-
-    // 1. GNOME
-    log.push_str("--- [STRATEGY 1 : GNOME SHELL DBUS EXTENSION] ---\n");
-    for method in ["GetWindowUnderCursor", "GetActiveWindow"] {
-        log.push_str(&format!("▶ Command: gdbus call --session --dest org.gnome.Shell --object-path /org/boring/WindowTracker --method org.gnome.Shell.{method}\n"));
-        match Command::new("gdbus")
-            .args([
-                "call",
-                "--session",
-                "--dest",
-                "org.gnome.Shell",
-                "--object-path",
-                "/org/boring/WindowTracker",
-                "--method",
-                &format!("org.boring.WindowTracker.{method}"),
-            ])
-            .output()
-        {
-            Ok(out) => {
-                log.push_str(&format!("   Exit Status: {}\n", out.status));
-                log.push_str(&format!("   Stdout: {}\n", String::from_utf8_lossy(&out.stdout).trim()));
-                log.push_str(&format!("   Stderr: {}\n", String::from_utf8_lossy(&out.stderr).trim()));
-            }
-            Err(e) => log.push_str(&format!("   Error: {e}\n")),
+    log.push_str("🔍 --- WINDOW DETECTION DIAGNOSTICS (macOS) ---\n\n");
+    log.push_str("Strategy: NSWorkspace.frontmostApplication\n");
+    match frontmost_app() {
+        Some((bundle, name, pid)) => {
+            log.push_str(&format!("• Bundle id: {bundle}\n• Name: {name}\n• PID: {pid}\n"));
         }
+        None => log.push_str("• No frontmost application reported\n"),
     }
-    log.push_str(&format!("GNOME Result: {:?}\n\n", detect_gnome_window()));
-
-    // 2. KDE
-    log.push_str("--- [STRATEGY 2 : KDE PLASMA KWIN] ---\n");
-    log.push_str(&run_kde_diagnostics());
-    log.push_str(&format!("KDE Result: {:?}\n\n", detect_kde_window()));
-
-    // 3. Hyprland
-    log.push_str("--- [STRATEGY 3 : HYPRLAND (hyprctl)] ---\n");
-    match Command::new("hyprctl").args(["activewindow", "-j"]).output() {
-        Ok(out) => {
-            log.push_str(&format!("   Exit Status: {}\n", out.status));
-            log.push_str(&format!("   Stdout: {}\n", String::from_utf8_lossy(&out.stdout).trim()));
-        }
-        Err(e) => log.push_str(&format!("   Error: {e}\n")),
-    }
-    log.push_str(&format!("Hyprland Result: {:?}\n\n", detect_hyprland_window()));
-
-    // 4. Sway
-    log.push_str("--- [STRATEGY 4 : SWAY (swaymsg)] ---\n");
-    match Command::new("swaymsg").args(["-t", "get_tree"]).output() {
-        Ok(out) => {
-            log.push_str(&format!("   Exit Status: {}\n", out.status));
-            log.push_str(&format!("   Stdout length: {} bytes\n", out.stdout.len()));
-        }
-        Err(e) => log.push_str(&format!("   Error: {e}\n")),
-    }
-    log.push_str(&format!("Sway Result: {:?}\n\n", detect_sway_window()));
-
-    // 5. X11
-    log.push_str("--- [STRATEGY 5 : X11 / XWAYLAND (xprop)] ---\n");
-    match Command::new("xprop").args(["-root", "_NET_ACTIVE_WINDOW"]).output() {
-        Ok(out) => {
-            log.push_str(&format!("   Exit Status: {}\n", out.status));
-            log.push_str(&format!("   Stdout: {}\n", String::from_utf8_lossy(&out.stdout).trim()));
-        }
-        Err(e) => log.push_str(&format!("   Error: {e}\n")),
-    }
-    log.push_str(&format!("X11 Result: {:?}\n\n", detect_x11_window()));
-
-    log.push_str(&format!("🎯 GLOBAL DETECTED RESULT: '{}'\n", detect_active_window()));
+    log.push_str(&format!(
+        "• Accessibility (post events / tap buttons): {}\n",
+        if super::input_emitter::check_post_access() { "granted" } else { "MISSING" }
+    ));
+    log.push_str(&format!(
+        "• Input Monitoring (HID++): {}\n",
+        if super::permissions::input_monitoring_granted() { "granted" } else { "MISSING" }
+    ));
+    log.push_str(&format!("\n🎯 GLOBAL DETECTED RESULT: '{}'\n", detect_active_window()));
     log
 }
 
-/// Runs detailed raw diagnostics specifically for KDE Plasma KWin.
+/// Kept for API compatibility with the Linux Debug tab.
 pub fn run_kde_diagnostics() -> String {
-    super::kde::run_kde_diagnostics()
+    "KDE diagnostics are not applicable on macOS.\n".to_string()
+}
+
+/// The Linux build offered a GNOME Shell extension here; the macOS Settings
+/// card shows the privacy permissions instead (Accessibility + Input Monitoring).
+pub fn check_gnome_extension_status_lang(lang: &str) -> (bool, String) {
+    super::permissions::status_summary(lang)
+}
+
+pub fn install_or_update_gnome_extension_lang(_lang: &str) -> Result<String, String> {
+    super::permissions::request_missing()
 }
