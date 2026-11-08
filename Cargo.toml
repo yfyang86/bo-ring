@@ -33,6 +33,6 @@ core-graphics = "0.23"
 core-foundation = "0.9"
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", features = ["NSString", "NSArray", "NSEnumerator", "NSThread", "NSGeometry", "NSValue"] }
-objc2-app-kit = { version = "0.2", features = ["libc", "NSWorkspace", "NSRunningApplication", "NSScreen", "NSEvent", "NSGraphicsContext"] }
+objc2-app-kit = { version = "0.2", features = ["libc", "NSWorkspace", "NSRunningApplication", "NSScreen", "NSEvent", "NSGraphicsContext", "NSApplication", "NSResponder", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView", "NSMenu", "NSMenuItem", "NSImage", "NSCell"] }
 winit = { version = "0.29", default-features = false }
 

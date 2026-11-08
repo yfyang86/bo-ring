@@ -14,6 +14,7 @@ pub mod autostart;
 pub mod event_tap;
 pub mod input_emitter;
 pub mod ipc;
+pub mod menubar;
 pub mod overlay;
 pub mod permissions;
 pub mod uninstall;

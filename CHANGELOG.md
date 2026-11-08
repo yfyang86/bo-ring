@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Menu-bar ring switcher:** a daemon menu-bar icon with *Follow Frontmost App*,
+  *Always Default Ring* and *Always: <profile>*, plus Open Ring, Settings… and Show Log.
+  The icon shows the current mode. The choice is kept in `~/.config/bo-ring/ring-mode`,
+  outside `config.toml`, so the configurator's Save never resets it.
+- `bo-ring --ring-mode [auto|default|<profile label or app id>]` to show or switch the
+  mode from scripts.
+- `[general] menu_bar_icon = false` hides the icon.
+
+### Fixed
+- **Pressing the ring button again didn't close the ring.** Rings spawned by the daemon
+  inherited its blocked SIGTERM, ignored the close signal, and the next press stacked a
+  second ring. Every process now unblocks those signals at startup.
+- Only `*.toml` files in `rings/` are loaded. A stray backup such as
+  `default.ring.toml.bak` could silently replace the main ring, so one slot ran another
+  slot's action.
+
 ## [0.2.0-mac.3] - 2026-11-08
 
 ### Fixed

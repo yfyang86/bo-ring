@@ -110,6 +110,29 @@ default ring. Apps are matched by **bundle id** (e.g. `com.apple.Safari`). Add a
 with the **Ring** tab → app profiles, and put its bundle id in *App ID*. To find a bundle
 id, run `osascript -e 'id of app "Notes"'`.
 
+### Switch rings from the menu bar
+The daemon puts a ring icon in the menu bar. Its **Ring to show** menu sets which ring
+opens:
+* **Follow Frontmost App** (default): the per-app ring for the active app, if one matches.
+  The icon is a hollow ring.
+* **Always Default Ring**: ignore the per-app rings. The icon is filled and labelled
+  *Default*.
+* **Always: <profile>**: pin one ring, e.g. *Web Browsers*, wherever you are. The icon
+  shows the profile's name.
+
+The menu also has **Open Ring**, **Settings…** and **Show Log**. The choice applies from
+the next ring you open and is stored in `~/.config/bo-ring/ring-mode`, so saving in the
+configurator never resets it. To script it:
+
+```bash
+bo-ring --ring-mode               # show the current mode
+bo-ring --ring-mode default       # always the default ring
+bo-ring --ring-mode "web browsers"   # pin a profile, by label or app id ("vscode", "com.apple.Safari")
+bo-ring --ring-mode auto          # follow the frontmost app again
+```
+
+To hide the icon, set `menu_bar_icon = false` under `[general]` in `config.toml`.
+
 ### Remap mouse buttons
 In the **Buttons** tab, click a button on the mouse picture, or press the physical button to
 capture it, then choose an action:
@@ -141,6 +164,7 @@ $B                  # configurator (also starts the daemon if it isn't running)
 $B --daemon         # run the daemon in the foreground (logs to the terminal)
 $B --toggle         # open / close the ring through the running daemon
 $B --ring           # show the ring overlay on its own (no daemon needed)
+$B --ring-mode default   # which ring to show: auto | default | <profile>
 $B --install-agent  # install + start the daemon LaunchAgent
 $B --uninstall      # remove LaunchAgents, config and logs (asks first)
 ```
@@ -148,7 +172,10 @@ $B --uninstall      # remove LaunchAgents, config and logs (asks first)
 ### Files
 | Path | Contents |
 |---|---|
-| `~/.config/bo-ring/config.toml`, `rings/*.ring.toml` | configuration (same format as Linux) |
+| `~/.config/bo-ring/rings/default.ring.toml` | **the main ring**: slots, submenus, actions. Edit this file by hand, not `config.toml` |
+| `~/.config/bo-ring/rings/<app>.ring.toml` | per-app rings |
+| `~/.config/bo-ring/ring-mode` | menu-bar ring choice: `auto`, `default` or `app:<app_id>` |
+| `~/.config/bo-ring/config.toml` | general settings and **button mappings**. Its ring sections are a copy written on Save; nothing reads them back |
 | `~/Library/LaunchAgents/dev.bo-ring.daemon.plist` | daemon autostart |
 | `~/Library/Logs/bo-ring/daemon.log` | daemon log (button presses, HID++ diversion, permission warnings) |
 
@@ -161,6 +188,10 @@ $B --uninstall      # remove LaunchAgents, config and logs (asks first)
   new signature, so macOS ignores permissions granted to an earlier build even when the
   switch still shows on.
 * **The ring opens, but shortcuts don't reach the app.** That needs **Accessibility**.
+* **A slot runs the wrong action, or an edit has no effect.** Edit
+  `rings/default.ring.toml`, not `config.toml`. Close the configurator first, or its next
+  Save writes its in-memory copy back. Only `*.toml` files in `rings/` are loaded, so keep
+  backups elsewhere.
 * **The side buttons aren't remapped.** The event tap needs **Accessibility**. A log that
   repeats `Could not create the mouse event tap` means it's missing.
 

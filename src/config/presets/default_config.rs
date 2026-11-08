@@ -458,6 +458,7 @@ pub fn default_config_for_lang(lang: &str) -> Config {
             dev_mode: false,
             mode_editor: false,
             device_profile: "auto".to_string(),
+            menu_bar_icon: true,
         },
         buttons,
         ring_menu: RingMenuConfig {
