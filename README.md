@@ -74,6 +74,96 @@ cd boring-mac
 Permissions attach to the binary that asks for them. If you run it from a terminal,
 macOS attributes them to the terminal app instead.
 
+## Usage
+
+### Open the ring
+* **MX Master 4:** press the **haptic thumb panel** (the pad under your thumb). It sends
+  button code 278, which is mapped to *Action Ring* by default.
+* **Any other mouse:** map a button to *Action Ring* in the configurator (see below).
+* **Keyboard or scripts:** run `/Applications/Bo-Ring.app/Contents/MacOS/bo-ring --toggle`
+  from any hotkey tool (Raycast, Alfred, Karabiner, BetterTouchTool, a Shortcuts *Run Shell
+  Script* action…). Running it again closes the ring.
+
+The ring opens centered on the pointer, on whichever display the pointer is on.
+
+### Pick a slot
+| Input | Effect |
+|---|---|
+| Move the pointer toward a slot, then **click** | run the slot (or open its submenu) |
+| **Scroll wheel** | cycle through the slots (Ring tab → *wheel navigation*) |
+| **Middle click** | run the highlighted slot |
+| **Right click** / **Esc** | leave a submenu / close the ring |
+| Click outside the ring, or press the ring button again | close the ring |
+
+**Trigger modes** (Ring tab → *hold* checkbox):
+* **Hybrid** (default, checkbox on): a quick press keeps the ring open so you can click a
+  slot; press, hold, hover a slot and release to run it immediately.
+* **Click** (checkbox off): click to open, click a slot to run it, click the center to
+  close.
+* **Hold to release:** hold the button, hover a slot, release to run it. Set
+  `trigger_mode = "HoldToRelease"` in `config.toml`; the UI doesn't offer this mode.
+
+### Per-app rings
+The ring follows the frontmost app: Safari, Chrome, Firefox, Brave, Arc, Edge, VS Code,
+Cursor, Zed, Finder, Blender and GIMP have their own rings, and everything else gets the
+default ring. Apps are matched by **bundle id** (e.g. `com.apple.Safari`). Add another app
+with the **Ring** tab → app profiles, and put its bundle id in *App ID*. To find a bundle
+id, run `osascript -e 'id of app "Notes"'`.
+
+### Remap mouse buttons
+In the **Buttons** tab, click a button on the mouse picture, or press the physical button to
+capture it, then choose an action:
+* **Action Ring**: open the ring.
+* **Keyboard shortcut**: e.g. `CMD` + `SHIFT` + `4`. Use `CMD`, `CTRL`, `ALT` (Option),
+  `SHIFT`, `fn`. Media keys: `PlayPause`, `NextSong`, `VolumeUp`, `Mute`…
+* **Command**: any shell command, e.g. `open -a Notes` or `open https://github.com`.
+* **Folder**: open a folder in Finder.
+
+Remapped buttons are swallowed, so the frontmost app never sees the original click.
+Unmapped buttons, and left and right clicks, always pass through unchanged. On the
+MX Master 4 the haptic panel (278), gesture button (281) and SmartShift (280) are captured
+over HID++; the back, forward and middle buttons (275 / 276 / 274) through the event tap.
+
+**Click Save** to apply. The background daemon restarts with the new configuration.
+
+### Configurator tabs
+| Tab | What it does |
+|---|---|
+| **Buttons** | map physical buttons to actions; see the detected mouse and its battery level |
+| **Ring** | edit ring slots, icons (emoji or a PNG/WebP image), colors, submenus, per-app rings, trigger mode and wheel navigation |
+| **Settings** | language; **Background Service** (LaunchAgent), *open at login*, an Applications launcher, the **privacy permission** status, import/export config |
+| **Debug** | full diagnostics: frontmost-app detection and the Accessibility / Input Monitoring status |
+
+### Command line
+```bash
+B=/Applications/Bo-Ring.app/Contents/MacOS/bo-ring
+$B                  # configurator (also starts the daemon if it isn't running)
+$B --daemon         # run the daemon in the foreground (logs to the terminal)
+$B --toggle         # open / close the ring through the running daemon
+$B --ring           # show the ring overlay on its own (no daemon needed)
+$B --install-agent  # install + start the daemon LaunchAgent
+$B --uninstall      # remove LaunchAgents, config and logs (asks first)
+```
+
+### Files
+| Path | Contents |
+|---|---|
+| `~/.config/bo-ring/config.toml`, `rings/*.ring.toml` | configuration (same format as Linux) |
+| `~/Library/LaunchAgents/dev.bo-ring.daemon.plist` | daemon autostart |
+| `~/Library/Logs/bo-ring/daemon.log` | daemon log (button presses, HID++ diversion, permission warnings) |
+
+### Troubleshooting
+* **Nothing happens when I press the button.** Look at `daemon.log`. You should see
+  `Diverted CID 0x01A0` when the daemon starts and `[HID++ Press]` for each press. If not,
+  re-grant **Input Monitoring** and **Accessibility** to Bo-Ring (remove it with **–**, add
+  it with **+**), then restart the daemon with
+  `launchctl kickstart -k gui/$(id -u)/dev.bo-ring.daemon`. Every new ad-hoc build has a
+  new signature, so macOS ignores permissions granted to an earlier build even when the
+  switch still shows on.
+* **The ring opens, but shortcuts don't reach the app.** That needs **Accessibility**.
+* **The side buttons aren't remapped.** The event tap needs **Accessibility**. A log that
+  repeats `Could not create the mouse event tap` means it's missing.
+
 ## Run / develop
 
 ```bash

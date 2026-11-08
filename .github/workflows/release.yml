@@ -1,0 +1,99 @@
+name: Release (macOS)
+
+# Merging a version bump to main releases it: if Cargo.toml's version has no
+# tag yet, build + verify the DMG, then create the tag and a GitHub release
+# whose notes come from that version's CHANGELOG.md section.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: tag & release (macOS arm64)
+    runs-on: macos-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version
+        id: v
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          TAG="v$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || gh release view "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG already released — nothing to do"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.v.outputs.exists == 'false'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.v.outputs.exists == 'false'
+
+      - name: Test
+        if: steps.v.outputs.exists == 'false'
+        run: cargo test --locked
+
+      - name: Build DMG
+        if: steps.v.outputs.exists == 'false'
+        run: |
+          scripts/build-dmg.sh
+          DMG="dist/Bo-Ring-${{ steps.v.outputs.version }}-arm64.dmg"
+          hdiutil verify "$DMG"
+          (cd dist && shasum -a 256 "$(basename "$DMG")" > "$(basename "$DMG").sha256")
+          echo "DMG=$DMG" >> "$GITHUB_ENV"
+
+      - name: Release notes
+        if: steps.v.outputs.exists == 'false'
+        run: |
+          V="${{ steps.v.outputs.version }}"
+          # The CHANGELOG section for this version, without its heading.
+          awk -v v="$V" '
+            $0 ~ "^## \\[" v "\\]" { on=1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md | sed '/^---$/d' > notes.md
+          [ -s notes.md ] || echo "macOS build of Bo-Ring $V." > notes.md
+          SHA=$(cut -d' ' -f1 "$DMG.sha256")
+          cat >> notes.md <<NOTES
+
+          ## Download
+          **\`$(basename "$DMG")\`**, for Apple Silicon on macOS 11+.
+
+          SHA-256: \`$SHA\`
+
+          ## Install / upgrade
+          1. Quit Bo-Ring, drag **Bo-Ring** into **Applications** (replace the old copy), and open it. The first time, use **right-click → Open**, because the build is ad-hoc signed, not notarized.
+          2. Opening the app starts the background daemon.
+          3. Allow Bo-Ring under **System Settings → Privacy & Security → Accessibility** and **Input Monitoring**. **When upgrading**, remove the old Bo-Ring entries with **–** and add the new app with **+**, because macOS ignores permissions granted to a previous build. Then restart the daemon: \`launchctl kickstart -k gui/\$(id -u)/dev.bo-ring.daemon\`.
+
+          See the [README](https://github.com/${{ github.repository }}/blob/${{ steps.v.outputs.tag }}/README.md#usage) for usage.
+          NOTES
+          sed -i '' 's/^          //' notes.md
+          cat notes.md
+
+      - name: Create tag and release
+        if: steps.v.outputs.exists == 'false'
+        run: |
+          V="${{ steps.v.outputs.version }}"
+          PRE=""; case "$V" in *-*) PRE="--prerelease";; esac
+          gh release create "${{ steps.v.outputs.tag }}" $PRE \
+            --target "$GITHUB_SHA" \
+            --title "Bo-Ring $V — macOS (Apple Silicon)" \
+            --notes-file notes.md \
+            "$DMG" "$DMG.sha256"
