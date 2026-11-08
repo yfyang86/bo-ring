@@ -449,7 +449,7 @@ pub fn render_node_action_selector(
 ) {
     let current_action_clone = action.clone();
     let is_keycombo = matches!(current_action_clone, Some(ButtonActionConfig::KeyCombo { .. }));
-    let is_folder = matches!(&current_action_clone, Some(ButtonActionConfig::Command { cmd }) if cmd.starts_with("xdg-open ") && !cmd.starts_with("xdg-open http"));
+    let is_folder = matches!(&current_action_clone, Some(ButtonActionConfig::Command { cmd }) if cmd.starts_with("open ") && !cmd.starts_with("open http"));
     let is_preset = !is_keycombo && !is_folder;
 
     // Option A: Catalog Preset
@@ -457,9 +457,9 @@ pub fn render_node_action_selector(
     let term_label = tr(lang, "quick_terminal");
     let brow_label = tr(lang, "quick_browser");
     let presets: [(&str, &str); 3] = [
-        ("loginctl lock-session", lock_label),
-        ("gnome-terminal", term_label),
-        ("xdg-open http://google.com", brow_label),
+        ("pmset displaysleepnow", lock_label),
+        ("open -a Terminal", term_label),
+        ("open http://google.com", brow_label),
     ];
 
     let mut current_preset_idx = presets
@@ -525,13 +525,13 @@ pub fn render_node_action_selector(
 
     // Option C: Open Folder
     if ui.radio(is_folder, tr(lang, "folder_path_option")).clicked() {
-        *action = Some(ButtonActionConfig::Command { cmd: "xdg-open ~".to_string() });
+        *action = Some(ButtonActionConfig::Command { cmd: "open ~".to_string() });
     }
 
     if is_folder {
         ui.indent("folder_path_node_indent", |ui| {
             let mut current_path = if let Some(ButtonActionConfig::Command { cmd }) = action.as_ref() {
-                if let Some(folder) = cmd.strip_prefix("xdg-open ") {
+                if let Some(folder) = cmd.strip_prefix("open ") {
                     folder.to_string()
                 } else {
                     cmd.clone()
@@ -543,7 +543,7 @@ pub fn render_node_action_selector(
             ui.horizontal(|ui| {
                 ui.label(tr(lang, "folder_path_label"));
                 if ui.add(egui::TextEdit::singleline(&mut current_path).desired_width(150.0)).changed() {
-                    *action = Some(ButtonActionConfig::Command { cmd: format!("xdg-open {}", current_path) });
+                    *action = Some(ButtonActionConfig::Command { cmd: format!("open {}", current_path) });
                 }
 
                 let browse_btn = egui::Button::new(
@@ -555,7 +555,7 @@ pub fn render_node_action_selector(
                 if ui.add(browse_btn).clicked() {
                     if let Some(path) = rfd::FileDialog::new().pick_folder() {
                         let path_str = path.to_string_lossy().to_string();
-                        *action = Some(ButtonActionConfig::Command { cmd: format!("xdg-open {}", path_str) });
+                        *action = Some(ButtonActionConfig::Command { cmd: format!("open {}", path_str) });
                     }
                 }
             });

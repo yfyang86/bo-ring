@@ -110,7 +110,7 @@ pub fn gimp_profile_for_lang(lang: &str) -> AppProfileConfig {
                 label: t.undo.to_string(),
                 translations: super::build_translation_map(GIMP_TRANSLATIONS, |x| x.undo),
                 icon: "↩️".to_string(),
-                action: Some(ButtonActionConfig::KeyCombo { keys: vec!["CTRL".to_string(), "z".to_string()] }),
+                action: Some(ButtonActionConfig::KeyCombo { keys: vec!["CMD".to_string(), "z".to_string()] }),
                 items: vec![],
                 auto_close: true,
                 color: None,
@@ -121,7 +121,7 @@ pub fn gimp_profile_for_lang(lang: &str) -> AppProfileConfig {
                 label: t.redo.to_string(),
                 translations: super::build_translation_map(GIMP_TRANSLATIONS, |x| x.redo),
                 icon: "↪️".to_string(),
-                action: Some(ButtonActionConfig::KeyCombo { keys: vec!["CTRL".to_string(), "y".to_string()] }),
+                action: Some(ButtonActionConfig::KeyCombo { keys: vec!["CMD".to_string(), "y".to_string()] }),
                 items: vec![],
                 auto_close: true,
                 color: None,
@@ -132,7 +132,7 @@ pub fn gimp_profile_for_lang(lang: &str) -> AppProfileConfig {
                 label: t.export_as.to_string(),
                 translations: super::build_translation_map(GIMP_TRANSLATIONS, |x| x.export_as),
                 icon: "💾".to_string(),
-                action: Some(ButtonActionConfig::KeyCombo { keys: vec!["CTRL".to_string(), "SHIFT".to_string(), "e".to_string()] }),
+                action: Some(ButtonActionConfig::KeyCombo { keys: vec!["CMD".to_string(), "SHIFT".to_string(), "e".to_string()] }),
                 items: vec![],
                 auto_close: true,
                 color: None,
@@ -142,7 +142,7 @@ pub fn gimp_profile_for_lang(lang: &str) -> AppProfileConfig {
     };
 
     AppProfileConfig {
-        app_id: "gimp".to_string(),
+        app_id: "gimp; org.gimp.gimp-2.10; org.gimp.gimp-3; org.gimp.gimp".to_string(),
         label: t.profile_label.to_string(),
         translations: super::build_translation_map(GIMP_TRANSLATIONS, |x| x.profile_label),
         logo_path: "assets/apps/gimp.webp".to_string(),

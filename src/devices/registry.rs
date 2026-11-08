@@ -153,6 +153,9 @@ impl DeviceRegistry {
         self.scan_directory(Path::new("assets/devices"), false);
         self.scan_directory(Path::new("bo-ring/assets/devices"), false);
 
+        if let Some(res) = crate::utils::path::bundle_resources_dir() {
+            self.scan_directory(&res.join("assets").join("devices"), false);
+        }
         self.scan_directory(&xdg_data.join("bo-ring").join("assets").join("devices"), false);
         self.scan_directory(&xdg_data.join("bo-ring").join("devices"), false);
         self.scan_directory(Path::new("/usr/local/share/bo-ring/devices"), false);

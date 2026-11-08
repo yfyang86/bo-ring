@@ -4,13 +4,12 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-/// Returns the XDG runtime socket path (`$XDG_RUNTIME_DIR/bo-ring.sock` or `/tmp/bo-ring.sock`).
+/// Daemon socket path in the per-user runtime dir (`$TMPDIR/bo-ring.sock` on macOS).
 pub fn daemon_socket_path() -> PathBuf {
-    if let Ok(dir) = env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(&dir).join("bo-ring.sock")
-    } else {
-        PathBuf::from("/tmp/bo-ring.sock")
+    if let Ok(dir) = env::var("BO_RING_RUNTIME_DIR") {
+        return PathBuf::from(dir).join("bo-ring.sock");
     }
+    super::overlay::runtime_dir().join("bo-ring.sock")
 }
 
 pub type IpcClients = Arc<Mutex<Vec<UnixStream>>>;
@@ -201,9 +200,9 @@ mod tests {
 
     #[test]
     fn test_daemon_ipc_command_wire() {
-        let cmd = DaemonIpcCommand::ExecCmd("xdg-open https://google.com".to_string());
-        assert_eq!(cmd.to_wire_format(), "EXEC:CMD:xdg-open https://google.com\n");
-        assert_eq!(DaemonIpcCommand::parse_wire_line("EXEC:CMD:xdg-open https://google.com"), Some(cmd));
+        let cmd = DaemonIpcCommand::ExecCmd("open https://google.com".to_string());
+        assert_eq!(cmd.to_wire_format(), "EXEC:CMD:open https://google.com\n");
+        assert_eq!(DaemonIpcCommand::parse_wire_line("EXEC:CMD:open https://google.com"), Some(cmd));
 
         let key_cmd = DaemonIpcCommand::ExecKey(vec!["CTRL".to_string(), "t".to_string()]);
         assert_eq!(key_cmd.to_wire_format(), "EXEC:KEY:CTRL,t\n");

@@ -458,7 +458,7 @@ impl eframe::App for ConfigApp {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            egui::RichText::new(format!("Bo-Ring v{} • Linux Wayland & X11", env!("CARGO_PKG_VERSION")))
+                            egui::RichText::new(format!("Bo-Ring v{} • macOS", env!("CARGO_PKG_VERSION")))
                                 .small()
                                 .color(egui::Color32::from_gray(100)),
                         );

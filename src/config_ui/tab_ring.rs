@@ -230,7 +230,7 @@ impl ConfigApp {
                                         Some(ElementTypeChoice::DirectAction) => {
                                             slot.items.clear();
                                             if slot.action.is_none() {
-                                                slot.action = Some(ButtonActionConfig::Command { cmd: "firefox".to_string() });
+                                                slot.action = Some(ButtonActionConfig::Command { cmd: "open -a Safari".to_string() });
                                             }
                                         }
                                         Some(ElementTypeChoice::SubMenu) => {
@@ -238,7 +238,7 @@ impl ConfigApp {
                                                 label: "Sub-item 1".to_string(),
                                                 translations: std::collections::HashMap::new(),
                                                 icon: "⚡".to_string(),
-                                                action: Some(ButtonActionConfig::Command { cmd: "firefox".to_string() }),
+                                                action: Some(ButtonActionConfig::Command { cmd: "open -a Safari".to_string() }),
                                                 items: vec![],
                                                 auto_close: true,
                                                 color: None,
@@ -315,7 +315,7 @@ impl ConfigApp {
                                             Some(ElementTypeChoice::DirectAction) => {
                                                 sub.items.clear();
                                                 if sub.action.is_none() {
-                                                    sub.action = Some(ButtonActionConfig::Command { cmd: "firefox".to_string() });
+                                                    sub.action = Some(ButtonActionConfig::Command { cmd: "open -a Safari".to_string() });
                                                 }
                                             }
                                             Some(ElementTypeChoice::SubMenu) => {
@@ -323,7 +323,7 @@ impl ConfigApp {
                                                     label: "Sub-action 1".to_string(),
                                                     translations: std::collections::HashMap::new(),
                                                     icon: "⚡".to_string(),
-                                                    action: Some(ButtonActionConfig::Command { cmd: "firefox".to_string() }),
+                                                    action: Some(ButtonActionConfig::Command { cmd: "open -a Safari".to_string() }),
                                                     items: vec![],
                                                     auto_close: true,
                                                     color: None,
@@ -355,7 +355,7 @@ impl ConfigApp {
                                                     label: format!("Level 3 - {}", new_num),
                                                     translations: std::collections::HashMap::new(),
                                                     icon: "⚡".to_string(),
-                                                    action: Some(ButtonActionConfig::Command { cmd: "firefox".to_string() }),
+                                                    action: Some(ButtonActionConfig::Command { cmd: "open -a Safari".to_string() }),
                                                     items: vec![],
                                                     auto_close: true,
                                                     color: None,
@@ -799,7 +799,7 @@ impl ConfigApp {
                         label: format!("Slot {}", new_slot),
                         translations: std::collections::HashMap::new(),
                         icon: "⚡".to_string(),
-                        action: Some(ButtonActionConfig::Command { cmd: "firefox".to_string() }),
+                        action: Some(ButtonActionConfig::Command { cmd: "open -a Safari".to_string() }),
                         items: vec![],
                         auto_close: true,
                         color: None,
@@ -1031,7 +1031,7 @@ impl ConfigApp {
                                         label: format!("Action {}", new_num),
                                         translations: std::collections::HashMap::new(),
                                         icon: "⚡".to_string(),
-                                        action: Some(ButtonActionConfig::Command { cmd: "firefox".to_string() }),
+                                        action: Some(ButtonActionConfig::Command { cmd: "open -a Safari".to_string() }),
                                         items: vec![],
                                         auto_close: true,
                                         color: None,

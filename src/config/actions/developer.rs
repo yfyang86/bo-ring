@@ -56,28 +56,28 @@ pub fn developer_actions_for_lang(lang: &str) -> Vec<NamedActionConfig> {
             label: t.terminal.to_string(),
             translations: build_translation_map(DEVELOPER_TRANSLATIONS, |x| x.terminal),
             icon: "💻".to_string(),
-            action: ButtonActionConfig::Command { cmd: "ptyxis || gnome-terminal || kgx || konsole || alacritty || kitty || x-terminal-emulator || xterm".to_string() },
+            action: ButtonActionConfig::Command { cmd: "open -a Terminal".to_string() },
         },
         NamedActionConfig {
             id: "dev_vscode_palette".to_string(),
             label: t.vscode_palette.to_string(),
             translations: build_translation_map(DEVELOPER_TRANSLATIONS, |x| x.vscode_palette),
             icon: "💻".to_string(),
-            action: ButtonActionConfig::KeyCombo { keys: vec!["CTRL".to_string(), "SHIFT".to_string(), "p".to_string()] },
+            action: ButtonActionConfig::KeyCombo { keys: vec!["CMD".to_string(), "SHIFT".to_string(), "p".to_string()] },
         },
         NamedActionConfig {
             id: "dev_global_search".to_string(),
             label: t.global_search.to_string(),
             translations: build_translation_map(DEVELOPER_TRANSLATIONS, |x| x.global_search),
             icon: "🔍".to_string(),
-            action: ButtonActionConfig::KeyCombo { keys: vec!["CTRL".to_string(), "SHIFT".to_string(), "f".to_string()] },
+            action: ButtonActionConfig::KeyCombo { keys: vec!["CMD".to_string(), "SHIFT".to_string(), "f".to_string()] },
         },
         NamedActionConfig {
             id: "dev_secondary_sidebar".to_string(),
             label: t.secondary_sidebar.to_string(),
             translations: build_translation_map(DEVELOPER_TRANSLATIONS, |x| x.secondary_sidebar),
             icon: "📑".to_string(),
-            action: ButtonActionConfig::KeyCombo { keys: vec!["CTRL".to_string(), "ALT".to_string(), "b".to_string()] },
+            action: ButtonActionConfig::KeyCombo { keys: vec!["CMD".to_string(), "ALT".to_string(), "b".to_string()] },
         },
     ]
 }

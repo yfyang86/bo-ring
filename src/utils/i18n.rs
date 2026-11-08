@@ -54,6 +54,9 @@ impl I18nManager {
             PathBuf::from("/usr/share/bo-ring/locales"),
         ];
 
+        if let Some(res) = crate::utils::path::bundle_resources_dir() {
+            locale_dirs.push(res.join("locales"));
+        }
         // XDG standard path for user custom locales
         if let Ok(home) = std::env::var("HOME") {
             locale_dirs.push(PathBuf::from(&home).join(".config/bo-ring/locales"));

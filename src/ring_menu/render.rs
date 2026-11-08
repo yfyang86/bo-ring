@@ -100,7 +100,6 @@ impl eframe::App for RingMenuApp {
                 } else if line.starts_with("STATE:RELEASED") || line.starts_with("R:") {
                     self.button_released = true;
                     self.button_held = false;
-                    crate::keyboard::nudge_mouse();
                     ctx.request_repaint();
                 }
             }
@@ -118,65 +117,20 @@ impl eframe::App for RingMenuApp {
                 let painter = ui.painter();
                 let raw_pointer = ctx.input(|i| i.pointer.hover_pos());
 
-                // === WAYLAND CURSOR POSITIONING WORKAROUND ===
-                //
-                // Problem: On Wayland (GNOME/Mutter, KDE/KWin, wlroots/Sway, Hyprland),
-                // when a new window appears, the compositor sends a `wl_pointer.enter`
-                // event with the cursor coordinates. However, these initial coordinates
-                // are often stale or incorrect — they don't reflect the true cursor
-                // position until a real `wl_pointer.motion` event is received.
-                //
-                // Solution: We detect actual mouse movement by comparing pointer positions
-                // across consecutive frames. The daemon injects a net-zero mouse nudge via
-                // uinput after spawning the ring window (see keyboard::nudge_mouse()),
-                // which triggers a real `wl_pointer.motion` event from the compositor.
-                //
-                // Until the center is locked, the window stays fully transparent (nothing
-                // is rendered), so the user never sees the ring at a wrong position.
+                // macOS: the overlay knows the real global cursor position, so
+                // the ring is centred immediately (the Linux build had to wait for
+                // a Wayland motion event after a uinput nudge).
                 if self.center.is_none() {
-                    let mut lock_pos = None;
-                    let elapsed = self.opened_at.elapsed().as_millis();
-
-                    if let Some(pos) = raw_pointer {
-                        if !self.has_nudged {
-                            // Wait for the compositor to fully map, place, and maximize the window before nudging
-                            if elapsed < 200 {
-                                ctx.request_repaint();
-                                return;
-                            }
-                            self.has_nudged = true;
-                            self.last_pointer = Some(pos);
-                            crate::keyboard::nudge_mouse();
-                            ctx.request_repaint();
-                            return; // Wait for true motion event
-                        }
-
-                        // On the frame immediately following the nudge, the pointer motion event
-                        // has been processed by the compositor, so `pos` is accurate and up-to-date.
-                        lock_pos = Some(pos);
-                        self.last_pointer = Some(pos);
-                    } else if elapsed > 800 {
-                        // Emergency fallback if pointer event withheld after 800ms
-                        lock_pos = Some(egui::pos2(rect.width() / 2.0, rect.height() / 2.0));
-                    }
-
-
-                    if let Some(pos) = lock_pos {
-                        println!("🎯 Center locked: ({}, {})", pos.x, pos.y);
-                        self.center = Some(pos);
-                        if self.config.animation != RingAnimation::None {
-                            self.anim_start = Some(Instant::now());
-                        }
-                    } else {
-                        ctx.request_repaint();
-                        return; // Stay fully transparent until center is locked
+                    let pos = crate::platform::overlay::ring_center_in_window();
+                    let pos = if rect.contains(pos) { pos } else { raw_pointer.unwrap_or(rect.center()) };
+                    println!("🎯 Center locked: ({}, {})", pos.x, pos.y);
+                    self.center = Some(pos);
+                    self.last_pointer = Some(pos);
+                    self.has_nudged = true;
+                    if self.config.animation != RingAnimation::None {
+                        self.anim_start = Some(Instant::now());
                     }
                 }
-
-
-
-
-
 
                 // Compute animation progress (0.0 → 1.0)
                 let anim_t = match self.config.animation {
@@ -425,7 +379,7 @@ impl eframe::App for RingMenuApp {
                     center,
                     egui::Align2::CENTER_CENTER,
                     center_icon,
-                    egui::FontId::proportional(15.0 * anim_t),
+                    egui::FontId::proportional((15.0 * anim_t).max(0.5)),
                     with_alpha(egui::Color32::from_rgb(40, 40, 40), alpha),
                 );
 
@@ -834,7 +788,7 @@ impl eframe::App for RingMenuApp {
                 } else {
                     crate::utils::i18n::tr(lang, "general_menu_badge").replace("{}", &self.display_app_name())
                 };
-                let font_id = egui::FontId::proportional(12.0 * anim_t);
+                let font_id = egui::FontId::proportional((12.0 * anim_t).max(0.5));
                 let text_size = ui.fonts(|f| f.layout_no_wrap(badge_text.clone(), font_id.clone(), egui::Color32::WHITE)).rect.size();
 
                 let badge_rect = egui::Rect::from_center_size(

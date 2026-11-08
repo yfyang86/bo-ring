@@ -33,9 +33,11 @@ pub fn render_tab_debug(app: &mut ConfigApp, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             ui.label(egui::RichText::new(tr(&lang, "graphical_env_header")).strong().color(egui::Color32::WHITE));
             ui.add_space(6.0);
-            let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "Unknown".into());
-            let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "Unknown".into());
-            let display = std::env::var("WAYLAND_DISPLAY").or_else(|_| std::env::var("DISPLAY")).unwrap_or_else(|_| "Unknown".into());
+            let desktop = "macOS (Aqua)".to_string();
+            let session = std::process::Command::new("sw_vers").arg("-productVersion").output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|_| "Unknown".into());
+            let display = "Quartz / WindowServer".to_string();
 
             ui.horizontal(|ui| {
                 ui.label(format!("{} {}", tr(&lang, "desktop_label"), desktop));

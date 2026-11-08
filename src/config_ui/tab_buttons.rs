@@ -246,13 +246,13 @@ impl ConfigApp {
                         // 3. Action Catalog Items
                         let catalog: &[ActionItem] = &[
                             // Navigation
-                            ActionItem { category: ActionCategory::Navigation, icon: "⬅️", title_key: "action_back", desc_key: "action_back_desc", action: ButtonActionConfig::KeyCombo { keys: vec!["ALT".to_string(), "Left".to_string()] } },
-                            ActionItem { category: ActionCategory::Navigation, icon: "➡️", title_key: "action_next", desc_key: "action_next_desc", action: ButtonActionConfig::KeyCombo { keys: vec!["ALT".to_string(), "Right".to_string()] } },
-                            ActionItem { category: ActionCategory::Navigation, icon: "🔀", title_key: "action_switch_app", desc_key: "action_switch_app_desc", action: ButtonActionConfig::KeyCombo { keys: vec!["ALT".to_string(), "Tab".to_string()] } },
+                            ActionItem { category: ActionCategory::Navigation, icon: "⬅️", title_key: "action_back", desc_key: "action_back_desc", action: ButtonActionConfig::KeyCombo { keys: vec!["CMD".to_string(), "[".to_string()] } },
+                            ActionItem { category: ActionCategory::Navigation, icon: "➡️", title_key: "action_next", desc_key: "action_next_desc", action: ButtonActionConfig::KeyCombo { keys: vec!["CMD".to_string(), "]".to_string()] } },
+                            ActionItem { category: ActionCategory::Navigation, icon: "🔀", title_key: "action_switch_app", desc_key: "action_switch_app_desc", action: ButtonActionConfig::KeyCombo { keys: vec!["CMD".to_string(), "Tab".to_string()] } },
                             // Windows & Workspace
-                            ActionItem { category: ActionCategory::Windows, icon: "🪟", title_key: "action_overview", desc_key: "action_overview_desc", action: ButtonActionConfig::KeyCombo { keys: vec!["Super".to_string()] } },
-                            ActionItem { category: ActionCategory::Windows, icon: "💻", title_key: "action_show_desktop", desc_key: "action_show_desktop_desc", action: ButtonActionConfig::KeyCombo { keys: vec!["CTRL".to_string(), "ALT".to_string(), "d".to_string()] } },
-                            ActionItem { category: ActionCategory::Windows, icon: "📸", title_key: "action_screenshot", desc_key: "action_screenshot_desc", action: ButtonActionConfig::KeyCombo { keys: vec!["Print".to_string()] } },
+                            ActionItem { category: ActionCategory::Windows, icon: "🪟", title_key: "action_overview", desc_key: "action_overview_desc", action: ButtonActionConfig::KeyCombo { keys: vec!["CTRL".to_string(), "Up".to_string()] } },
+                            ActionItem { category: ActionCategory::Windows, icon: "💻", title_key: "action_show_desktop", desc_key: "action_show_desktop_desc", action: ButtonActionConfig::KeyCombo { keys: vec!["fn".to_string(), "F11".to_string()] } },
+                            ActionItem { category: ActionCategory::Windows, icon: "📸", title_key: "action_screenshot", desc_key: "action_screenshot_desc", action: ButtonActionConfig::KeyCombo { keys: vec!["CMD".to_string(), "SHIFT".to_string(), "4".to_string()] } },
                             // Media
                             ActionItem { category: ActionCategory::Media, icon: "⏯️", title_key: "action_play_pause", desc_key: "action_play_pause_desc", action: ButtonActionConfig::KeyCombo { keys: vec!["PlayPause".to_string()] } },
                             ActionItem { category: ActionCategory::Media, icon: "⏭️", title_key: "action_next_song", desc_key: "action_next_song_desc", action: ButtonActionConfig::KeyCombo { keys: vec!["NextSong".to_string()] } },
@@ -261,10 +261,10 @@ impl ConfigApp {
                             ActionItem { category: ActionCategory::Media, icon: "🔉", title_key: "action_vol_down", desc_key: "action_vol_down_desc", action: ButtonActionConfig::KeyCombo { keys: vec!["VolumeDown".to_string()] } },
                             ActionItem { category: ActionCategory::Media, icon: "🔇", title_key: "action_mute", desc_key: "action_mute_desc", action: ButtonActionConfig::KeyCombo { keys: vec!["Mute".to_string()] } },
                             // Apps & System
-                            ActionItem { category: ActionCategory::Apps, icon: "🖥️", title_key: "action_custom_cmd", desc_key: "action_custom_cmd_desc", action: ButtonActionConfig::Command { cmd: "gnome-terminal || ptyxis || kgx || konsole || alacritty || kitty || x-terminal-emulator || xterm".to_string() } },
-                            ActionItem { category: ActionCategory::System, icon: "🔒", title_key: "action_lock", desc_key: "action_lock_desc", action: ButtonActionConfig::Command { cmd: "loginctl lock-session".to_string() } },
-                            ActionItem { category: ActionCategory::System, icon: "🚪", title_key: "action_logout", desc_key: "action_logout_desc", action: ButtonActionConfig::Command { cmd: "loginctl terminate-user \"\"".to_string() } },
-                            ActionItem { category: ActionCategory::System, icon: "⏻", title_key: "action_poweroff", desc_key: "action_poweroff_desc", action: ButtonActionConfig::Command { cmd: "systemctl poweroff".to_string() } },
+                            ActionItem { category: ActionCategory::Apps, icon: "🖥️", title_key: "action_custom_cmd", desc_key: "action_custom_cmd_desc", action: ButtonActionConfig::Command { cmd: "open -a Terminal".to_string() } },
+                            ActionItem { category: ActionCategory::System, icon: "🔒", title_key: "action_lock", desc_key: "action_lock_desc", action: ButtonActionConfig::Command { cmd: "pmset displaysleepnow".to_string() } },
+                            ActionItem { category: ActionCategory::System, icon: "🚪", title_key: "action_logout", desc_key: "action_logout_desc", action: ButtonActionConfig::Command { cmd: "osascript -e 'tell application \"System Events\" to log out'".to_string() } },
+                            ActionItem { category: ActionCategory::System, icon: "⏻", title_key: "action_poweroff", desc_key: "action_poweroff_desc", action: ButtonActionConfig::Command { cmd: "osascript -e 'tell application \"System Events\" to shut down'".to_string() } },
                         ];
 
                         for item in catalog {
@@ -305,8 +305,8 @@ impl ConfigApp {
                                     });
 
                                     let mut folder_path = if let Some(ButtonActionConfig::Command { ref cmd }) = current_action {
-                                        if cmd.starts_with("xdg-open ") && !cmd.starts_with("xdg-open http") {
-                                            cmd["xdg-open ".len()..].to_string()
+                                        if cmd.starts_with("open ") && !cmd.starts_with("open http") {
+                                            cmd["open ".len()..].to_string()
                                         } else {
                                             "~".to_string()
                                         }
@@ -316,7 +316,7 @@ impl ConfigApp {
 
                                     ui.horizontal(|ui| {
                                         if ui.add(egui::TextEdit::singleline(&mut folder_path).desired_width(ui.available_width() - 85.0)).changed() {
-                                            self.config.buttons.insert(current_code, ButtonActionConfig::Command { cmd: format!("xdg-open {}", folder_path) });
+                                            self.config.buttons.insert(current_code, ButtonActionConfig::Command { cmd: format!("open {}", folder_path) });
                                         }
 
                                         let browse_btn = egui::Button::new(
@@ -329,7 +329,7 @@ impl ConfigApp {
                                         if ui.add(browse_btn).clicked() {
                                             if let Some(path) = rfd::FileDialog::new().pick_folder() {
                                                 let path_str = path.to_string_lossy().to_string();
-                                                self.config.buttons.insert(current_code, ButtonActionConfig::Command { cmd: format!("xdg-open {}", path_str) });
+                                                self.config.buttons.insert(current_code, ButtonActionConfig::Command { cmd: format!("open {}", path_str) });
                                                 self.notify_success(tr(&lang, "status_folder_assigned").replace("{}", &path_str));
                                             }
                                         }
@@ -646,7 +646,7 @@ impl ConfigApp {
                                     ui.separator();
                                     if ui.selectable_label(false, format!("📂 {}", tr(&lang, "open_devices_folder_btn"))).clicked() {
                                         let dir = crate::devices::DeviceRegistry::ensure_user_devices_dir();
-                                        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+                                        let _ = std::process::Command::new("open").arg(dir).spawn();
                                     }
                                     if ui.selectable_label(false, format!("🔄 {}", tr(&lang, "refresh_profiles_btn"))).clicked() {
                                         refresh_requested = true;
@@ -1073,7 +1073,7 @@ impl ConfigApp {
                             Some(ButtonActionConfig::ShowRingMenu) => ("⭕ Action Ring".to_string(), true),
                             Some(ButtonActionConfig::KeyCombo { keys }) => (format!("⌨ {}", keys.join("+")), true),
                             Some(ButtonActionConfig::Command { cmd }) => {
-                                if cmd.starts_with("xdg-open ") {
+                                if cmd.starts_with("open ") {
                                     (tr(&lang, "summary_folder").to_string(), true)
                                 } else {
                                     (tr(&lang, "summary_cmd").to_string(), true)

@@ -250,7 +250,8 @@ impl RingMenuApp {
             }
         }
 
-        raw.to_string()
+        // macOS ids are bundle ids: show the app's name ("org.mozilla.firefox" → "Firefox").
+        crate::active_window::display_name_for(raw).unwrap_or_else(|| raw.to_string())
     }
 
     /// Begin the close animation smoothly so pulse animations and fade transitions complete.
@@ -283,7 +284,7 @@ pub fn execute_action_direct(action: &ButtonActionConfig) {
         ButtonActionConfig::Command { cmd } => {
             println!("🚀 Running command: '{}'", cmd);
             let trimmed = cmd.trim();
-            if trimmed.contains('|') || trimmed.contains('&') || trimmed.contains(';') || trimmed.contains('>') || trimmed.contains('<') || trimmed.contains('$') {
+            if trimmed.contains('|') || trimmed.contains('&') || trimmed.contains(';') || trimmed.contains('>') || trimmed.contains('<') || trimmed.contains('$') || trimmed.contains('\'') || trimmed.contains('"') {
                 let _ = Command::new("sh").args(["-c", trimmed]).spawn();
             } else {
                 let mut parts = trimmed.split_whitespace();
