@@ -74,6 +74,7 @@ fn main() {
 
     if !args.iter().any(|arg| arg == "--daemon") {
         println!("🎛️ Launching Configuration Menu...");
+        autostart::ensure_daemon_running_from_bundle();
         let config = Config::load_or_default();
         run_config_gui(config);
         return;

@@ -98,10 +98,29 @@ fn install_agent(label: &str, args: &[&str], keep_alive: bool, log_name: &str) -
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("{label}.plist"));
     fs::write(&path, agent_plist(label, args, keep_alive, log_name)).map_err(|e| e.to_string())?;
-    let _ = launchctl(&["bootout", &format!("{}/{}", domain(), label)]);
-    launchctl(&["bootstrap", &domain(), &path.to_string_lossy()])?;
-    let _ = launchctl(&["enable", &format!("{}/{}", domain(), label)]);
-    Ok(())
+    let target = format!("{}/{}", domain(), label);
+    let _ = launchctl(&["enable", &target]);
+    // `bootout` is asynchronous: wait for the old instance to unload, otherwise
+    // the following `bootstrap` fails with "5: Input/output error".
+    if launchctl(&["bootout", &target]).is_ok() {
+        for _ in 0..40 {
+            if !is_loaded(label) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    let mut last_err = String::new();
+    for _ in 0..5 {
+        match launchctl(&["bootstrap", &domain(), &path.to_string_lossy()]) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                last_err = e;
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+    }
+    Err(last_err)
 }
 
 fn remove_agent(label: &str) -> Result<(), String> {
@@ -134,11 +153,45 @@ pub fn is_systemd_active() -> bool {
 }
 
 pub fn enable_systemd_service() -> Result<(), String> {
+    let _ = fs::remove_file(opt_out_marker());
     install_agent(DAEMON_LABEL, &["--daemon"], true, "daemon.log")
 }
 
 pub fn disable_systemd_service() -> Result<(), String> {
+    // Remember the choice so the app never silently re-enables the daemon.
+    if let Some(dir) = opt_out_marker().parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(opt_out_marker(), "daemon LaunchAgent disabled by the user\n");
     remove_agent(DAEMON_LABEL)
+}
+
+/// Written when the user turns the background service off in Settings.
+fn opt_out_marker() -> PathBuf {
+    get_home_dir().join(".config/bo-ring/.daemon-disabled")
+}
+
+fn daemon_reachable() -> bool {
+    std::os::unix::net::UnixStream::connect(super::ipc::daemon_socket_path()).is_ok()
+}
+
+/// Called when the configurator starts. A DMG install has no installer step,
+/// so when running from `Bo-Ring.app` make sure the daemon (which captures the
+/// buttons and shows the ring) is running: start the LaunchAgent if it exists,
+/// install it on first launch, and respect a previous opt-out.
+pub fn ensure_daemon_running_from_bundle() {
+    if crate::utils::path::bundle_resources_dir().is_none() || daemon_reachable() {
+        return;
+    }
+    if !is_systemd_installed() && opt_out_marker().exists() {
+        println!("ℹ️ Background service disabled by the user; not starting the daemon.");
+        return;
+    }
+    match install_agent(DAEMON_LABEL, &["--daemon"], true, "daemon.log") {
+        // (Re)bootstrapping also re-points the agent at this app after an update or move.
+        Ok(()) => println!("✅ Bo-Ring daemon LaunchAgent started from {}", get_exe_path().display()),
+        Err(e) => eprintln!("⚠️ Could not start the Bo-Ring daemon: {e}"),
+    }
 }
 
 pub fn restart_systemd_service_if_active() {

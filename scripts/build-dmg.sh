@@ -76,7 +76,7 @@ cat > "$STAGE/READ ME FIRST.txt" <<TXT
 Bo-Ring $VERSION for macOS
 
 1. Drag Bo-Ring into Applications, then open it (first time: right-click → Open).
-2. Settings → Background Service → enable the LaunchAgent (starts the daemon at login).
+2. Opening Bo-Ring starts its background daemon (runs at login; Settings → Background Service turns it off).
 3. Allow Bo-Ring in System Settings → Privacy & Security → Accessibility and
    Input Monitoring when asked, then restart the service from Settings.
 
